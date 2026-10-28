@@ -46,6 +46,7 @@ impl Space {
         if file.find_key_block(&self.key.wrapping_key(), self.key.slots())?.is_some() {
             return Err(Error::WordsInUse);
         }
+        file.take_over()?;
         let objects = self.sql(objects_with_sizes(self.db()))?;
         let pages: i64 = self.sql(self.db().query_row("PRAGMA page_count", [], |row| row.get(0)))?;
         // Room in blocks: the database's pages and its tag table, every object's blocks.
@@ -62,7 +63,7 @@ impl Space {
         // VACUUM INTO writes a compact copy of the database; SQLite opens it through the
         // VFS under the copy's name. Then the copy turns to WAL mode.
         self.sql(self.db().execute("VACUUM INTO ?1", [&copy.name]))?;
-        copy.db = Some(connect(&copy.name, false)?);
+        copy.db = Some(connect(&copy.name, false, &copy.store)?);
         // All rows in one transaction, so that the log stays small.
         let rows = copy.sql(copy.db().unchecked_transaction())?;
         for (id, _) in objects {
@@ -80,7 +81,7 @@ impl Space {
         let object = source.object(id)?;
         let key = Key::random();
         let count = u32::try_from(object.size.div_ceil(PAYLOAD as u64)).map_err(|_| Error::Damaged)?;
-        let runs = self.store.lock().unwrap().allocate(count, count)?;
+        let runs = self.store.lock().unwrap().allocate(count, count, 1)?;
         let mut block = Zeroizing::new([0u8; BLOCK]);
         for index in 0..u64::from(count) {
             let from = runs::nth(&object.runs, index).ok_or(Error::Damaged)?;
@@ -90,10 +91,12 @@ impl Space {
             let to = runs::nth(&runs, index).expect("allocated above");
             self.store.lock().unwrap().write_block(to, &key, &mut block)?;
         }
-        self.sql(self.db().execute(
-            "UPDATE temple_objects SET key = ?2, blocks = ?3 WHERE id = ?1",
-            rusqlite::params![id, &key.as_bytes()[..], runs::encode(&runs)],
-        ))?;
+        self.as_temple(|db| {
+            db.execute(
+                "UPDATE temple_objects SET key = ?2, blocks = ?3 WHERE id = ?1",
+                rusqlite::params![id, &key.as_bytes()[..], runs::encode(&runs)],
+            )
+        })?;
         Ok(())
     }
 }

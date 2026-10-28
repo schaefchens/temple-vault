@@ -258,8 +258,11 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
             event.target.value = '';
             if (!file) return;
             run(async () => {
-              const object = await space.putObject(new Uint8Array(await file.arrayBuffer()));
-              await execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, file.name, file.size]);
+              const bytes = new Uint8Array(await file.arrayBuffer());
+              await transaction(space, async () => {
+                const object = await space.putObject(bytes);
+                await execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, file.name, file.size]);
+              });
             });
           }}
         />
@@ -284,10 +287,12 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
           </button>
           <button
             onClick={() =>
-              run(async () => {
-                await space.deleteObject(file.object);
-                await execute('DELETE FROM file WHERE id = ?', [file.id]);
-              })
+              run(() =>
+                transaction(space, async () => {
+                  await space.deleteObject(file.object);
+                  await execute('DELETE FROM file WHERE id = ?', [file.id]);
+                }),
+              )
             }
           >
             Remove
@@ -305,8 +310,22 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
   );
 }
 
-/** Temple's self-test in this browser, for the E2E run: `?self-test`. */
+/** Temple's self-test in this browser, for the E2E run: `?self-test` – once asked for here: a link alone could start it, and it writes two vaults of some hundred megabytes. */
 function SelfTest() {
+  const [asked, setAsked] = useState(false);
+  if (!asked) {
+    return (
+      <main>
+        <h1>Self-test</h1>
+        <p>Runs Temple's checks in this browser: two vaults of some hundred megabytes, deleted at the end.</p>
+        <button onClick={() => setAsked(true)}>Run self-test</button>
+      </main>
+    );
+  }
+  return <SelfTestRun />;
+}
+
+function SelfTestRun() {
   const [checks, setChecks] = useState<Check[]>([]);
   const [done, setDone] = useState(false);
   useEffect(() => {
@@ -341,6 +360,18 @@ async function remove(name: string) {
       if (attempt === 50) throw error;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+  }
+}
+
+/** Runs statements in one transaction, rolled back if one fails: an object and its row go together. */
+async function transaction(space: Space, work: () => Promise<void>) {
+  await space.execute('BEGIN');
+  try {
+    await work();
+    await space.execute('COMMIT');
+  } catch (error) {
+    await space.execute('ROLLBACK').catch(() => {});
+    throw error;
   }
 }
 

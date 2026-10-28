@@ -28,6 +28,11 @@ pub(crate) const BLOCKS_PER_ZONE: u64 = ZONE / BLOCK as u64;
 const COPY_BLOCKS: u32 = (superblock::SIZE / BLOCK) as u32;
 /// The first block after the two superblock copies.
 pub(crate) const FIRST_FREE: u32 = 2 * COPY_BLOCKS;
+/// The log turns over at 4 MiB – or from 256 KiB on, once it holds more than the space has
+/// free – so that a long session neither grows the vault nor keeps deleted values readable
+/// for long.
+const LOG_LIMIT: u64 = 4 << 20;
+const LOG_LOW: u64 = 256 << 10;
 
 /// The files SQLite keeps in a space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,11 +63,16 @@ pub(crate) struct Store {
     /// Database pages were written since the tag table was.
     tags_changed: bool,
     free: Free,
+    /// The shortest free run a file the superblock records takes room from, unless one run
+    /// holds all it needs: a zone. Tests scatter files with 1.
+    file_piece: u32,
+    /// The log's size at which it turns over; tests lower it, or turn turning over off.
+    log_limit: Option<u64>,
     /// Freed blocks the newest superblock on disk may still list. They become free once a
-    /// superblock that doesn't is durable – database blocks scrubbed first, so deleted
-    /// pages can't be read with the space's key.
+    /// superblock that doesn't is durable.
     pending: Vec<Run>,
-    scrub: Vec<Run>,
+    /// Freed by the last turnover of the log: free from the next one on, or the next opening.
+    retired: Vec<Run>,
     /// Of the copies on disk, the highest.
     generation: u64,
     next_copy: usize,
@@ -74,12 +84,15 @@ pub(crate) struct Store {
     stale_copy: bool,
     /// While locking: the database pages the checkpoint writes.
     locking: Option<BTreeSet<u32>>,
-    /// Temple's own pragmas pass the VFS's guard.
+    /// Temple's own pragmas and statements pass the guards: the VFS's on pragmas, the
+    /// authorizer's on `temple_…` tables.
     pub(crate) admin: bool,
     /// Until a space has opened, and once opening or locking failed: nothing may be written.
     pub(crate) read_only: bool,
     /// SQLite has the database open.
     pub(crate) database_open: bool,
+    /// SQLite has the log open.
+    pub(crate) log_open: bool,
 }
 
 impl Store {
@@ -107,8 +120,10 @@ impl Store {
             tags_hash: Sha256::digest([]).into(),
             tags_changed: false,
             free,
+            file_piece: BLOCKS_PER_ZONE as u32,
+            log_limit: Some(LOG_LIMIT),
             pending: Vec::new(),
-            scrub: Vec::new(),
+            retired: Vec::new(),
             generation: 0,
             next_copy: 0,
             changed: true,
@@ -118,6 +133,7 @@ impl Store {
             admin: true,
             read_only: false,
             database_open: false,
+            log_open: false,
         }
     }
 
@@ -188,13 +204,15 @@ impl Store {
     }
 
     /// Works out the free blocks: all that neither the superblock nor the object index
-    /// claims.
+    /// claims. Objects whose blocks lie outside the space or overlap others keep them from
+    /// use, and fail when read – the space still opens.
     pub(crate) fn init_free(&mut self, objects: Vec<Run>) -> Result<(), Error> {
-        let mut used = objects;
-        used.extend(&self.database.runs);
-        used.extend(&self.log.runs);
-        used.extend(&self.tag_table.runs);
-        self.free = Free::complement(FIRST_FREE, self.blocks, used).ok_or(Error::Damaged)?;
+        let files =
+            [&self.database.runs, &self.log.runs, &self.tag_table.runs].into_iter().flatten().copied().collect();
+        self.free = Free::complement(FIRST_FREE, self.blocks, files).ok_or(Error::Damaged)?;
+        for run in objects {
+            self.free.remove(run);
+        }
         Ok(())
     }
 
@@ -202,7 +220,8 @@ impl Store {
     pub(crate) fn finish_create(&mut self) -> Result<(), Error> {
         self.write_tags()?;
         self.write_both(&[])?;
-        self.release()
+        self.release();
+        Ok(())
     }
 
     /// Rewrites the other superblock copy if it may still hold a session key: a crash during
@@ -317,10 +336,12 @@ impl Store {
     }
 
     fn write_unit(&mut self, file: File, index: u64, block: &mut [u8; BLOCK]) -> Result<(), Error> {
-        let number = runs::nth(&self.record(file).runs, index).expect("reserved before writing");
+        // Reserved before writing, and the log has its key: a bug otherwise, which fails the
+        // write rather than the process – this runs in SQLite's callbacks.
+        let number = runs::nth(&self.record(file).runs, index).ok_or(Error::Damaged)?;
         let key = match file {
             File::Database => &self.database_key,
-            File::Log => self.session.as_ref().expect("the log has a key while written"),
+            File::Log => self.session.as_ref().ok_or(Error::Damaged)?,
         };
         let tag = self.write_block(number, key, block)?;
         if file == File::Database {
@@ -338,8 +359,11 @@ impl Store {
         Ok(())
     }
 
-    /// Sets a file's size. Freed blocks wait for the next superblock; database blocks that
-    /// held pages are scrubbed then.
+    /// Sets a file's size. Freed blocks wait for the next superblock. Database blocks that
+    /// held pages get random bytes at once, so that no crash leaves deleted pages readable:
+    /// SQLite shortens the database only in a checkpoint – while the newest superblock on
+    /// disk still has the log, whose last commit ends the database before them – or while a
+    /// space is set up.
     pub(crate) fn truncate(&mut self, file: File, size: u64) -> Result<(), Error> {
         self.writable()?;
         let old = self.size(file);
@@ -354,21 +378,35 @@ impl Store {
         }
         let unit = unit(file) as u64;
         let (keep, held) = (size.div_ceil(unit), old.div_ceil(unit));
-        let record = self.record_mut(file);
-        record.size = size;
-        let mut freed = runs::split_off(&mut record.runs, keep);
+        let mut kept = self.record(file).runs.clone();
+        let mut freed = runs::split_off(&mut kept, keep);
         let spare = runs::split_off(&mut freed, held.saturating_sub(keep));
-        match file {
-            File::Database => {
-                self.tags.truncate(keep as usize);
-                self.tags_changed = true;
-                self.scrub.extend(freed);
-            }
-            File::Log => self.pending.extend(freed),
+        if file == File::Database {
+            self.scrub(&freed)?;
+            self.tags.truncate(keep as usize);
+            self.tags_changed = true;
         }
+        *self.record_mut(file) = FileRecord { size, runs: kept };
+        self.pending.extend(freed);
         self.pending.extend(spare);
         self.changed = true;
         Ok(())
+    }
+
+    /// Overwrites blocks with random bytes, durably.
+    fn scrub(&self, runs: &[Run]) -> Result<(), Error> {
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let mut noise = Noise::new();
+        let mut bytes = [0u8; BLOCK];
+        for run in runs {
+            for number in run.start..run.end() as u32 {
+                noise.fill(&mut bytes);
+                self.vault.write_at(&bytes, self.offset(number)?)?;
+            }
+        }
+        self.vault.sync()
     }
 
     /// Makes everything so far durable – SQLite calls it at every commit. Newly used blocks
@@ -380,7 +418,8 @@ impl Store {
             return self.vault.sync();
         }
         self.write_both(&[])?;
-        self.release()
+        self.release();
+        Ok(())
     }
 
     /// Locking starts: from here the superblock stays as it is until [`Store::finish_lock`],
@@ -401,6 +440,13 @@ impl Store {
             self.locking = None;
             return Ok(());
         }
+        self.finish_checkpoint()?;
+        self.release();
+        Ok(())
+    }
+
+    /// The record a checkpoint leaves, for a lock and a turnover alike.
+    fn finish_checkpoint(&mut self) -> Result<(), Error> {
         // Still locking: if the tag table needs room, the space grows without a record yet.
         self.write_tags()?;
         let written = self.locking.take().unwrap_or_default();
@@ -410,15 +456,53 @@ impl Store {
         self.pending.extend(log.runs);
         self.session = None;
         let checkpoint = self.checkpoint.clone();
-        self.write_both(&checkpoint)?;
-        self.release()
+        self.write_both(&checkpoint)
+    }
+
+    /// Whether the log should turn over, after a commit: see [`LOG_LIMIT`].
+    pub(crate) fn log_due(&self) -> bool {
+        let Some(limit) = self.log_limit else { return false };
+        let size = self.log.size;
+        let free = self.free.in_runs_of(1) * BLOCK as u64;
+        let due = size >= limit || (size >= LOG_LOW && free <= size);
+        due && self.session.is_some() && self.locking.is_none() && !self.read_only
+    }
+
+    /// The log turns over as at a lock, without closing: from here, the database pages a
+    /// checkpoint writes are noted.
+    pub(crate) fn begin_turnover(&mut self) {
+        self.locking = Some(BTreeSet::new());
+    }
+
+    /// After the checkpoint. If it emptied the log, the record becomes what a lock leaves,
+    /// and the next commit starts a log under a fresh key; what this turnover frees – the old
+    /// log, the old tag table – is free from the next turnover on, so that a copy of the vault
+    /// taken across this one finds them whole. If the checkpoint didn't empty the log, the log
+    /// stays with its key; a tag table goes with what the checkpoint wrote. Failing, the space
+    /// stops writing: its superblocks still hold the log, which no checkpoint overwrites.
+    pub(crate) fn finish_turnover(&mut self) -> Result<(), Error> {
+        let finished = if self.log.size == 0 {
+            self.finish_checkpoint().map(|()| {
+                for run in std::mem::replace(&mut self.retired, std::mem::take(&mut self.pending)) {
+                    self.free.add(run);
+                }
+            })
+        } else {
+            self.locking = None;
+            if self.tags_changed { self.write_tags() } else { Ok(()) }
+        };
+        if finished.is_err() {
+            self.locking = None;
+            self.read_only = true;
+        }
+        finished
     }
 
     /// Writes the tag table to fresh blocks; the old ones wait for the next superblock.
     fn write_tags(&mut self) -> Result<(), Error> {
         let content: Vec<u8> = self.tags.iter().flatten().copied().collect();
         let count = content.len().div_ceil(PAYLOAD) as u32;
-        let table = self.allocate(count, count)?;
+        let table = self.allocate_for_file(count, count)?;
         let mut block = [0u8; BLOCK];
         for (index, chunk) in content.chunks(PAYLOAD).enumerate() {
             block.fill(0);
@@ -443,37 +527,30 @@ impl Store {
         Ok(())
     }
 
-    /// Frees blocks no durable superblock lists any more, scrubbing database blocks first.
-    fn release(&mut self) -> Result<(), Error> {
-        if !self.scrub.is_empty() {
-            let scrub = std::mem::take(&mut self.scrub);
-            let mut noise = Noise::new();
-            let mut bytes = [0u8; BLOCK];
-            for run in &scrub {
-                for number in run.start..run.end() as u32 {
-                    noise.fill(&mut bytes);
-                    self.vault.write_at(&bytes, self.offset(number)?)?;
-                }
-            }
-            self.vault.sync()?;
-            self.pending.extend(scrub);
-        }
+    /// Frees blocks no durable superblock lists any more.
+    fn release(&mut self) {
         for run in self.pending.drain(..) {
             self.free.add(run);
         }
-        Ok(())
     }
 
-    /// Between `needed` and `wanted` free blocks: as many as are free, up to `wanted`. Only if
-    /// fewer than `needed` are left does the space grow.
-    pub(crate) fn allocate(&mut self, needed: u32, wanted: u32) -> Result<Vec<Run>, Error> {
+    /// Between `needed` and `wanted` free blocks, in one run or in runs of at least `piece`:
+    /// as many as there are, up to `wanted`. Only if fewer than `needed` are left does the
+    /// space grow.
+    pub(crate) fn allocate(&mut self, needed: u32, wanted: u32, piece: u32) -> Result<Vec<Run>, Error> {
         self.writable()?;
-        let free = self.free.total();
-        if free < u64::from(needed) {
-            self.grow(u64::from(needed) - free)?;
+        if self.free.room(piece) < u64::from(needed) {
+            // The new zones join the runs of `piece` blocks or more.
+            self.grow(u64::from(needed) - self.free.in_runs_of(piece))?;
         }
-        let n = u64::from(wanted.max(needed)).min(self.free.total());
-        Ok(self.free.take(n as u32))
+        let n = u64::from(wanted.max(needed)).min(self.free.room(piece));
+        Ok(self.free.take(n as u32, piece))
+    }
+
+    /// Blocks for a file the superblock records: in runs of a zone at least – or in one run,
+    /// if it needs less – so that however scattered the free room, the record stays short.
+    fn allocate_for_file(&mut self, needed: u32, wanted: u32) -> Result<Vec<Run>, Error> {
+        self.allocate(needed, wanted, wanted.max(needed).min(self.file_piece))
     }
 
     /// Gives back blocks that nothing durable points at.
@@ -491,7 +568,7 @@ impl Store {
         }
         let needed = u32::try_from(blocks - have).map_err(|_| too_large())?;
         let wanted = u32::try_from((have / 2).max(64)).unwrap_or(u32::MAX);
-        let added = self.allocate(needed, wanted)?;
+        let added = self.allocate_for_file(needed, wanted)?;
         let record = self.record_mut(file);
         for run in added {
             runs::push(&mut record.runs, run);
@@ -586,23 +663,32 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn fill_up(&mut self) {
         let n = self.free.total();
-        self.free.take(n as u32);
+        self.free.take(n as u32, 1);
     }
 
-    /// Free room in pieces of one block: every other free block taken, never to come back.
+    /// Free room in pieces of one block – every other free block taken, never to come back –
+    /// and files allowed to take such pieces, so that their records grow long.
     #[cfg(test)]
     pub(crate) fn fragment(&mut self) {
         let n = self.free.total();
-        for run in self.free.take(n as u32) {
+        for run in self.free.take(n as u32, 1) {
             for number in (run.start..run.end() as u32).step_by(2) {
                 self.free.add(Run { start: number, len: 1 });
             }
         }
+        self.file_piece = 1;
     }
 
     #[cfg(test)]
     pub(crate) fn log_runs(&self) -> usize {
         self.log.runs.len()
+    }
+
+    /// The log turns over at `bytes`, so that tests see it often – or with `None` never, so
+    /// that it takes a space's last blocks.
+    #[cfg(test)]
+    pub(crate) fn set_log_limit(&mut self, bytes: Option<u64>) {
+        self.log_limit = bytes;
     }
 }
 
@@ -662,7 +748,8 @@ pub(crate) fn too_large() -> Error {
 }
 
 /// Whether a superblock fits the file it was found in: its zones inside the file, one run
-/// after another, the first where the key block says; its files inside its blocks.
+/// after another, the first where the key block says; its files inside its blocks, and its
+/// database within its 1 GiB – before its tag table is read.
 fn fits(record: &Superblock, first_zone: u64, file_zones: u64) -> bool {
     let Some(blocks) = blocks_in(&record.extents) else { return false };
     let Some(first) = record.extents.first() else { return false };
@@ -683,6 +770,7 @@ fn fits(record: &Superblock, first_zone: u64, file_zones: u64) -> bool {
         && inside(&record.log)
         && inside(&record.tags)
         && record.database.size.is_multiple_of(BLOCK as u64)
+        && record.database.size <= u64::from(superblock::MAX_PAGES) * BLOCK as u64
         && record.tags.size == record.database.size / BLOCK as u64 * TAG as u64
         && holds(&record.database, BLOCK)
         && holds(&record.log, PAYLOAD)
@@ -723,4 +811,40 @@ fn checkpoint_present(vault: &VaultFile, record: &Superblock, tags: &[[u8; TAG]]
         }
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
+
+    /// From the review: a record could promise a database past its 1 GiB, and opening then
+    /// read a tag table to match into memory.
+    #[test]
+    fn a_database_past_its_limit_does_not_fit() {
+        let record = |pages: u64| {
+            let tag_blocks = (pages * TAG as u64).div_ceil(PAYLOAD as u64);
+            Superblock {
+                inner_version: INNER_VERSION,
+                generation: 1,
+                extents: vec![Extent { first_zone: 2, zones: 1100 }],
+                database: FileRecord {
+                    size: pages * BLOCK as u64,
+                    runs: vec![Run { start: FIRST_FREE, len: pages as u32 }],
+                },
+                log: FileRecord::default(),
+                tags: FileRecord {
+                    size: pages * TAG as u64,
+                    runs: vec![Run { start: FIRST_FREE + pages as u32, len: tag_blocks as u32 }],
+                },
+                tags_hash: [0; 32],
+                session: None,
+                checkpoint: Vec::new(),
+            }
+        };
+        let limit = u64::from(superblock::MAX_PAGES);
+        assert!(fits(&record(limit), 2, 1102));
+        assert!(!fits(&record(limit + 1), 2, 1102));
+    }
 }

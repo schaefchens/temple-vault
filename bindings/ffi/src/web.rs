@@ -1,6 +1,6 @@
 //! Vaults on the web: files in the origin private file system, read and written through sync
 //! access handles, which only a worker can open – so the module runs in one. A path is a
-//! file name there. New vaults are written as `.<name>.part` and renamed once complete, as
+//! file name there. New vaults are written as `.<name>.temple-part` and renamed once complete, as
 //! Temple does with files; a sync access handle keeps a file from being renamed, so the new
 //! vault's first space locks for the rename and opens again with its phrase key.
 
@@ -44,9 +44,15 @@ pub(crate) async fn open(name: &str) -> Result<temple_vault::Vault, TempleError>
 pub(crate) async fn copy_to_new_vault(space: &Space, name: &str) -> Result<temple_vault::Vault, TempleError> {
     let dir = directory().await?;
     let (part, handle) = start(&dir, name).await?;
-    // No await while the space is held: another call on it would find it taken.
-    let copied =
-        space.guard().as_ref().ok_or_else(locked).and_then(|space| Ok(space.copy_to_new_vault_with_handle(handle)?));
+    // No await while the space is held: another call on it would find it taken. A space that
+    // locked meanwhile leaves the handle to close – it would keep the file from being removed.
+    let copied = match space.guard().as_ref() {
+        Some(space) => space.copy_to_new_vault_with_handle(handle).map_err(TempleError::from),
+        None => {
+            handle.close();
+            Err(locked())
+        }
+    };
     match copied {
         Ok(vault) => drop(vault),
         Err(e) => {
@@ -58,19 +64,19 @@ pub(crate) async fn copy_to_new_vault(space: &Space, name: &str) -> Result<templ
     open(name).await
 }
 
-/// A fresh `.<name>.part` and a handle to it, after removing what a closed tab left there.
+/// A fresh `.<name>.temple-part` and a handle to it, after removing what a closed tab left
+/// there – unless another tab still writes it, whose handle keeps it from being removed.
 async fn start(
     dir: &FileSystemDirectoryHandle,
     name: &str,
 ) -> Result<(FileSystemFileHandle, FileSystemSyncAccessHandle), TempleError> {
-    // Left by a creation the tab's closing interrupted: never a vault, as it never got its name.
-    match remove(dir, &partial(name)).await {
-        Ok(()) | Err(TempleError::NotFound(_)) => {}
-        Err(e) => return Err(e),
-    }
     match file(dir, name, false).await {
         Err(TempleError::NotFound(_)) => {}
         Ok(_) => return Err(TempleError::AlreadyExists("something exists at the vault's path".into())),
+        Err(e) => return Err(e),
+    }
+    match remove(dir, &partial(name)).await {
+        Ok(()) | Err(TempleError::NotFound(_)) => {}
         Err(e) => return Err(e),
     }
     let part = file(dir, &partial(name), true).await?;
@@ -91,7 +97,7 @@ async fn finish(dir: &FileSystemDirectoryHandle, part: &FileSystemFileHandle, na
 }
 
 fn partial(name: &str) -> String {
-    format!(".{name}.part")
+    format!(".{name}.temple-part")
 }
 
 async fn directory() -> Result<FileSystemDirectoryHandle, TempleError> {

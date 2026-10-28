@@ -121,12 +121,31 @@ fn objects_round_trip() {
 }
 
 #[test]
-fn objects_are_written_outside_transactions() {
-    let (_memory, _vault, space) = new_vault();
-    space.db().execute_batch("BEGIN").unwrap();
-    assert!(matches!(space.put_object(&b"x"[..]), Err(Error::InTransaction)));
-    space.db().execute_batch("COMMIT").unwrap();
-    assert!(space.put_object(&b"x"[..]).is_ok());
+fn objects_commit_with_the_apps_rows() {
+    let (_memory, vault, space) = new_vault();
+    space.db().execute_batch("CREATE TABLE file (object INTEGER NOT NULL, name TEXT NOT NULL)").unwrap();
+    let file = |space: &Space, name: &str, then: &str| {
+        space.db().execute_batch("BEGIN").unwrap();
+        let id = space.put_object(&content(10_000, 7)[..]).unwrap();
+        space.db().execute("INSERT INTO file VALUES (?1, ?2)", (id, name)).unwrap();
+        space.db().execute_batch(then).unwrap();
+        id
+    };
+    let dropped = file(&space, "dropped", "ROLLBACK");
+    assert!(matches!(space.object_len(dropped), Err(Error::NoSuchObject)));
+    let kept = file(&space, "kept", "COMMIT");
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    let names: Vec<String> = space
+        .db()
+        .prepare("SELECT name FROM file")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(names, ["kept"]);
+    assert_eq!(space.read_object(kept, 0..10_000).unwrap(), content(10_000, 7));
 }
 
 #[test]
@@ -254,15 +273,20 @@ fn keeping_only_this_space_destroys_the_others() {
 }
 
 #[test]
-fn another_device_opening_the_vault_stops_writes() {
-    let (memory, _vault, space) = new_vault();
+fn another_device_opening_a_space_stops_writes() {
+    let (memory, vault, space) = new_vault();
     note(&space, "before");
-    let _elsewhere = reopen(&memory);
+    // Opening the vault alone writes nothing, and stops nothing.
+    let elsewhere = reopen(&memory);
+    note(&space, "still here");
+    let _there = elsewhere.unlock_with_key(&phrase(0).1).unwrap().unwrap();
     let refused = space.db().execute("INSERT INTO note VALUES ('after')", []);
     assert!(refused.is_err());
     assert!(space.changed_elsewhere());
     assert!(matches!(space.put_object(&b"x"[..]), Err(Error::ChangedElsewhere)));
     assert!(matches!(space.lock(), Err(Error::ChangedElsewhere)));
+    // This vault has stopped for good.
+    assert!(matches!(vault.unlock_with_key(&phrase(0).1), Err(Error::ChangedElsewhere)));
 }
 
 #[test]
@@ -296,19 +320,54 @@ fn a_damaged_space_is_not_repaired() {
     assert_eq!(before[ZONE as usize + 4096..], after[ZONE as usize + 4096..]);
 }
 
+/// From the review: one statement on Temple's table – an app duplicating an object's row –
+/// made a space refuse to open, for good. The app's SQL may only delete rows there now.
 #[test]
-fn a_space_whose_objects_overlap_its_database_is_not_repaired() {
+fn temple_tables_are_temples_to_write() {
+    let (_memory, vault, space) = new_vault();
+    let id = space.put_object(&content(10_000, 5)[..]).unwrap();
+    for sql in [
+        "INSERT INTO temple_objects (key, size, blocks) SELECT key, size, blocks FROM temple_objects",
+        "UPDATE temple_objects SET size = 1",
+        "DROP TABLE temple_objects",
+        "ALTER TABLE temple_objects ADD COLUMN extra",
+        "CREATE TABLE temple_mine (x)",
+        "CREATE TEMP TRIGGER copying AFTER INSERT ON main.temple_objects BEGIN SELECT 1; END",
+        "CREATE TABLE note (body); CREATE TRIGGER sneaking AFTER INSERT ON note BEGIN
+             INSERT INTO temple_objects (key, size, blocks) SELECT key, size, blocks FROM temple_objects; END;
+         INSERT INTO note VALUES ('x');",
+    ] {
+        assert!(space.db().execute_batch(sql).is_err(), "{sql}");
+    }
+    let again = space.put_object(&content(100, 6)[..]).unwrap();
+    space.db().execute("DELETE FROM temple_objects WHERE id = ?1", [again]).unwrap();
+    space.db().execute_batch("VACUUM").unwrap();
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    assert_eq!(space.read_object(id, 0..10_000).unwrap(), content(10_000, 5));
+}
+
+/// A row that doesn't add up – pointing at blocks the database uses, here written past the
+/// guard – no longer keeps the space from opening: it keeps those blocks from use, and its
+/// object fails when read. Nothing is written but the opening marker.
+#[test]
+fn a_space_whose_objects_overlap_its_database_still_opens() {
     let (memory, vault, space) = new_vault();
     note(&space, "x");
-    space.put_object(&content(10_000, 5)[..]).unwrap();
-    // Point the object at blocks the database uses: the space no longer adds up.
+    let id = space.put_object(&content(10_000, 5)[..]).unwrap();
+    space.store().admin = true;
     space.db().execute("UPDATE temple_objects SET blocks = ?1", [crate::space::encode_runs(32, 2)]).unwrap();
+    space.store().admin = false;
     space.lock().unwrap();
     drop(vault);
     let vault = reopen(&memory);
     let before = memory.bytes();
-    assert!(matches!(vault.unlock_with_key(&phrase(0).1), Err(Error::Damaged)));
-    assert!(before == memory.bytes());
+    let space = unlock(&vault, 0).unwrap();
+    assert_eq!(notes(&space), ["x"]);
+    assert!(matches!(space.read_object(id, 0..10_000), Err(Error::Damaged)));
+    let after = memory.bytes();
+    assert_eq!(before[..ZONE as usize], after[..ZONE as usize]);
+    assert_eq!(before[ZONE as usize + 4096..], after[ZONE as usize + 4096..]);
 }
 
 #[test]
@@ -466,4 +525,130 @@ fn a_space_database_opens_once() {
     assert!(space.db().execute(&format!("VACUUM INTO '{name}'"), []).is_err());
     note(&space, "still fine");
     assert_eq!(notes(&space), ["still fine"]);
+}
+
+/// From the review: free room in one-block holes – small objects, every other one deleted,
+/// the rest of the room taken – once let the log collect thousands of runs, until its record
+/// outgrew the superblock and commits and the lock failed.
+#[test]
+fn scattered_free_room_keeps_the_record_short() {
+    let (_memory, vault, space) = new_vault();
+    space.db().execute_batch("CREATE TABLE kv (k INTEGER PRIMARY KEY, v BLOB)").unwrap();
+    let ids: Vec<_> = (0..20_000u32).map(|i| space.put_object(&i.to_le_bytes()[..]).unwrap()).collect();
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    let free = space.store().free_blocks() as usize;
+    space.put_object(&vec![0u8; (free - 2000) * crate::space::PAYLOAD_BYTES][..]).unwrap();
+    let deletes = space.db().unchecked_transaction().unwrap();
+    for id in ids.iter().step_by(2) {
+        deletes.execute("DELETE FROM temple_objects WHERE id = ?1", [id]).unwrap();
+    }
+    deletes.commit().unwrap();
+    space.lock().unwrap();
+
+    let space = unlock(&vault, 0).unwrap();
+    for k in 0..5000i64 {
+        space.db().execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, vec![7u8; 3000]]).unwrap();
+    }
+    // 9,073 runs before the fix; a superblock copy holds about 8,000.
+    let log_runs = space.store().log_runs();
+    assert!(log_runs < 200, "{log_runs} log runs");
+    space.lock().unwrap();
+}
+
+/// From the review: the log emptied only at a lock, so 5,000 small commits in one session –
+/// an app saving a reading position – grew a vault by 50 MiB for good. It turns over now.
+#[test]
+fn a_long_session_keeps_the_vault_its_size() {
+    let (memory, vault, space) = new_vault();
+    space.db().execute_batch("CREATE TABLE progress (id INTEGER PRIMARY KEY, at TEXT)").unwrap();
+    space.lock().unwrap();
+    let before = memory.bytes().len();
+    let space = unlock(&vault, 0).unwrap();
+    for i in 0..5000 {
+        space.db().execute("INSERT OR REPLACE INTO progress VALUES (1, ?1)", [format!("John 3:{i}")]).unwrap();
+    }
+    space.lock().unwrap();
+    assert_eq!(memory.bytes().len(), before);
+}
+
+/// The same for a hidden space set up in one go with what it holds: it doubled after 692
+/// such commits before.
+#[test]
+fn a_hidden_space_keeps_its_size_through_many_commits() {
+    let (_memory, vault, space) = new_vault();
+    space.lock().unwrap();
+    let hidden = vault.create_space(&phrase(1).0, Setup { room: 16 << 20 }).unwrap();
+    hidden.put_object(&vec![3u8; 15 << 20][..]).unwrap();
+    hidden.db().execute_batch("CREATE TABLE progress (id INTEGER PRIMARY KEY, at TEXT)").unwrap();
+    let zones = hidden.zones();
+    for i in 0..3000 {
+        hidden.db().execute("INSERT OR REPLACE INTO progress VALUES (1, ?1)", [format!("John 3:{i}")]).unwrap();
+    }
+    assert_eq!(hidden.zones(), zones);
+}
+
+/// A turnover drops the log's key as a lock does: what the old log held can't be read any
+/// more, while the space stays open.
+#[test]
+fn deleted_values_are_unreadable_once_the_log_turned_over() {
+    let (memory, _vault, space) = new_vault();
+    space.store().set_log_limit(Some(64 << 10));
+    space.db().execute_batch("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT NOT NULL)").unwrap();
+    space.db().execute("INSERT INTO kv VALUES (1, ?1)", ["<turned over>".repeat(20)]).unwrap();
+    space.db().execute("DELETE FROM kv WHERE k = 1", []).unwrap();
+    let session = space.session_key().unwrap();
+    for k in 2..100 {
+        space.db().execute("INSERT INTO kv VALUES (?1, 'more')", [k]).unwrap();
+    }
+    let current = space.session_key();
+    assert!(current.is_none_or(|key| key.as_bytes() != session.as_bytes()), "the log never turned over");
+    let (master, first_zone) = (space.master_key(), space.first_zone());
+    assert!(!contains(&superblock_bytes(&memory.bytes(), &master, first_zone), session.as_bytes()));
+    assert!(!readable(&memory.bytes(), &[master.derive(b"temple/v1/db")]).contains("<turned over>"));
+}
+
+/// From the review: SQL could attach the space's log as a database and write into it – a
+/// crash then lost the session's commits. The log opens only as the database's log now.
+#[test]
+fn a_space_log_attaches_as_nothing() {
+    let (_memory, vault, space) = new_vault();
+    note(&space, "one");
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    let name = space.database_name().to_owned();
+    // With the log empty, before the session's first commit, and after it.
+    for _ in 0..2 {
+        let attached = space.db().execute_batch(&format!("ATTACH '{name}-wal' AS w; PRAGMA w.journal_mode = OFF;"));
+        assert!(attached.is_err());
+        note(&space, "more");
+    }
+    assert_eq!(notes(&space), ["one", "more", "more"]);
+}
+
+/// From the review: Temple told FTS5 tables by the text that made them, so a quoted module
+/// name or a comment slipped past, and it merged away old deletions only when it turned
+/// `secure-delete` on itself. Neither keeps a deleted term readable now.
+#[test]
+fn every_fts5_table_forgets_deleted_text() {
+    for create in [
+        "CREATE VIRTUAL TABLE verse USING \"fts5\"(body)",
+        "CREATE VIRTUAL TABLE verse /* using fts4 */ USING fts5(body)",
+        // The app turns the option on itself, after a deletion.
+        "CREATE VIRTUAL TABLE verse USING fts5(body);
+         INSERT INTO verse VALUES ('zebrafinchmarker early'); DELETE FROM verse;
+         INSERT INTO verse (verse, rank) VALUES ('secure-delete', 1);",
+    ] {
+        let (memory, vault, space) = new_vault();
+        space.db().execute_batch(create).unwrap();
+        space.db().execute_batch("INSERT INTO verse VALUES ('zebrafinchmarker went home'), ('another text');").unwrap();
+        space.lock().unwrap();
+        let space = unlock(&vault, 0).unwrap();
+        space.db().execute("DELETE FROM verse WHERE verse MATCH 'zebrafinchmarker'", []).unwrap();
+        let master = space.master_key();
+        space.lock().unwrap();
+        let text = readable(&memory.bytes(), &[master.derive(b"temple/v1/db")]);
+        assert!(!text.contains("zebrafinchmarker"), "{create}");
+        assert!(text.contains("another text"), "{create}");
+    }
 }

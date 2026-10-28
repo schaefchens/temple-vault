@@ -12,6 +12,8 @@ appId: de.schaefchens.temple.demo
 - tapOn:
     text: Open
     optional: true
+# A link alone doesn't start it.
+- tapOn: Run self-test
 - extendedWaitUntil:
     visible:
       id: self-test-result

@@ -41,6 +41,7 @@ interface BindingSpace extends Destroyable {
   phraseKey(): Promise<ArrayBuffer>;
   changedElsewhere(): Promise<boolean>;
   changeWords(words: number[]): Promise<void>;
+  forgetWords(words: number[]): Promise<boolean>;
   keepOnlyThis(): Promise<void>;
   copyToNewVault(path: string): Promise<BindingVault>;
   copyInto(vault: BindingVault): Promise<void>;
@@ -79,7 +80,7 @@ export function wrap(binding: Binding): Temple {
     constructor(readonly inner: BindingVault) {}
 
     async unlock(words: number[]) {
-      const space = await run(() => this.inner.unlock(words));
+      const space = await run(() => this.inner.unlock(valid(words)));
       return space ? new WrappedSpace(space) : null;
     }
 
@@ -89,7 +90,7 @@ export function wrap(binding: Binding): Temple {
     }
 
     async createSpace(words: number[], options?: { room?: number }) {
-      return new WrappedSpace(await run(() => this.inner.createSpace(words, room(options))));
+      return new WrappedSpace(await run(() => this.inner.createSpace(valid(words), room(options))));
     }
 
     close() {
@@ -99,6 +100,7 @@ export function wrap(binding: Binding): Temple {
 
   class WrappedSpace implements Space {
     #inner: BindingSpace | null;
+    #locking: Promise<void> | null = null;
 
     constructor(inner: BindingSpace) {
       this.#inner = inner;
@@ -128,16 +130,16 @@ export function wrap(binding: Binding): Temple {
     }
 
     async readObject(id: number, start = 0, end?: number) {
-      const to = end === undefined ? END : BigInt(end);
-      return new Uint8Array(await run(() => this.#space.readObject(BigInt(id), BigInt(start), to)));
+      const to = end === undefined ? END : whole(end, 'end');
+      return new Uint8Array(await run(() => this.#space.readObject(whole(id, 'id', true), whole(start, 'start'), to)));
     }
 
     async objectLength(id: number) {
-      return Number(await run(() => this.#space.objectLen(BigInt(id))));
+      return Number(await run(() => this.#space.objectLen(whole(id, 'id', true))));
     }
 
-    deleteObject(id: number) {
-      return run(() => this.#space.deleteObject(BigInt(id)));
+    async deleteObject(id: number) {
+      return run(() => this.#space.deleteObject(whole(id, 'id', true)));
     }
 
     async phraseKey() {
@@ -148,8 +150,12 @@ export function wrap(binding: Binding): Temple {
       return run(() => this.#space.changedElsewhere());
     }
 
-    changeWords(words: number[]) {
-      return run(() => this.#space.changeWords(words));
+    async changeWords(words: number[]) {
+      return run(() => this.#space.changeWords(valid(words)));
+    }
+
+    async forgetWords(words: number[]) {
+      return run(() => this.#space.forgetWords(valid(words)));
     }
 
     keepOnlyThis() {
@@ -165,16 +171,17 @@ export function wrap(binding: Binding): Temple {
       return run(() => this.#space.copyInto(vault.inner));
     }
 
-    /** Even when locking fails – another device opened the vault – the space is closed. */
-    async lock() {
+    /** Even when locking fails – another device opened the vault – the space is closed. Calls while it locks share that lock. */
+    lock() {
       const space = this.#inner;
-      if (!space) return;
-      try {
-        await run(() => space.lock());
-      } finally {
-        this.#inner = null;
-        space.uniffiDestroy?.();
+      if (!this.#locking && space) {
+        this.#locking = run(() => space.lock()).finally(() => {
+          this.#inner = null;
+          this.#locking = null;
+          space.uniffiDestroy?.();
+        });
       }
+      return this.#locking ?? Promise.resolve();
     }
 
     async isLocked() {
@@ -187,10 +194,10 @@ export function wrap(binding: Binding): Temple {
       return binding.generateWords();
     },
     async wordsAreValid(words: number[]) {
-      return binding.wordsAreValid(words);
+      return indices(words) !== null && binding.wordsAreValid(words);
     },
     async createVault(path: string, words: number[], options?: { room?: number }) {
-      const { vault, space } = await run(() => binding.createVault(path, words, room(options)));
+      const { vault, space } = await run(() => binding.createVault(path, valid(words), room(options)));
       return { vault: new WrappedVault(vault), space: new WrappedSpace(space) };
     },
     async openVault(path: string) {
@@ -200,7 +207,27 @@ export function wrap(binding: Binding): Temple {
 }
 
 function room(options?: { room?: number }): bigint {
-  return BigInt(options?.room ?? 0);
+  return whole(options?.room ?? 0, 'room');
+}
+
+/** Words as they cross into Rust: 12 whole numbers below 2048, or null – the bindings would turn 65536 or 0.5 into 0. */
+function indices(words: number[]): number[] | null {
+  const valid = Array.isArray(words) && words.length === 12;
+  return valid && words.every((index) => Number.isInteger(index) && index >= 0 && index < 2048) ? words : null;
+}
+
+function valid(words: number[]): number[] {
+  const checked = indices(words);
+  if (!checked) throw new TempleError('InvalidWords', 'words are 12 whole numbers below 2048');
+  return checked;
+}
+
+/** A whole number for Rust's 64 bits – where BigInt would throw a RangeError, a TempleError. */
+function whole(value: number, what: string, signed = false): bigint {
+  if (!Number.isSafeInteger(value) || (!signed && value < 0)) {
+    throw new TempleError('InvalidArgument', `${what} must be a whole number${signed ? '' : ' from 0'}, not ${value}`);
+  }
+  return BigInt(value);
 }
 
 /** The bytes a view covers, as their own ArrayBuffer – which crosses into Rust. */

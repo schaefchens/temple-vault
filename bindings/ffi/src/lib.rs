@@ -5,6 +5,7 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use zeroize::Zeroizing;
 use temple_vault::rusqlite::types::{ToSqlOutput, ValueRef};
 use temple_vault::rusqlite::{self, Connection, ToSql, params_from_iter};
 
@@ -33,7 +34,6 @@ pub enum TempleError {
     SpaceOpen(String),
     WordsInUse(String),
     NoSuchObject(String),
-    InTransaction(String),
     /// The space has locked; its words open it again.
     Locked(String),
     NotFound(String),
@@ -57,7 +57,6 @@ impl fmt::Display for TempleError {
         | SpaceOpen(message)
         | WordsInUse(message)
         | NoSuchObject(message)
-        | InTransaction(message)
         | Locked(message)
         | NotFound(message)
         | AlreadyExists(message)
@@ -83,12 +82,13 @@ impl From<temple_vault::Error> for TempleError {
             temple_vault::Error::SpaceOpen => TempleError::SpaceOpen(message),
             temple_vault::Error::WordsInUse => TempleError::WordsInUse(message),
             temple_vault::Error::NoSuchObject => TempleError::NoSuchObject(message),
-            temple_vault::Error::InTransaction => TempleError::InTransaction(message),
             temple_vault::Error::Database(_) => TempleError::Database(message),
             temple_vault::Error::Io(e) => match e.kind() {
                 std::io::ErrorKind::NotFound => TempleError::NotFound(message),
                 std::io::ErrorKind::AlreadyExists => TempleError::AlreadyExists(message),
                 std::io::ErrorKind::StorageFull => TempleError::StorageFull(message),
+                // Another process has the vault open.
+                std::io::ErrorKind::ResourceBusy => TempleError::InUse(message),
                 _ => TempleError::Io(message),
             },
         }
@@ -286,10 +286,18 @@ impl Space {
         self.with(|space| Ok(space.changed_elsewhere())).await
     }
 
-    /// New words for this space; a phrase key kept for quick unlock stops working.
+    /// New words for this space; a phrase key kept for quick unlock stops working. Interrupted,
+    /// both words open the space until the change is made again from the old ones, or the
+    /// old ones are forgotten from the new.
     pub async fn change_words(self: Arc<Self>, words: Vec<u16>) -> Result<(), TempleError> {
         let words = to_words(words)?;
         self.with(move |space| Ok(space.change_words(&words)?)).await
+    }
+
+    /// Words that open this space no more; whether they did. Not the words it was opened with.
+    pub async fn forget_words(self: Arc<Self>, words: Vec<u16>) -> Result<bool, TempleError> {
+        let words = to_words(words)?;
+        self.with(move |space| Ok(space.forget_words(&words)?)).await
     }
 
     /// Keeps only this space: every other space of the vault is gone at once.
@@ -329,13 +337,18 @@ impl Space {
     }
 }
 
+/// Words from the app's indices, which are wiped once read.
 fn to_words(indices: Vec<u16>) -> Result<temple_vault::Words, TempleError> {
-    let indices: [u16; 12] = indices.try_into().map_err(|_| temple_vault::Error::InvalidWords)?;
+    let indices = Zeroizing::new(indices);
+    let indices: [u16; 12] = indices.as_slice().try_into().map_err(|_| temple_vault::Error::InvalidWords)?;
     Ok(temple_vault::Words::from_indices(indices)?)
 }
 
+/// A phrase key from the app's bytes, which are wiped once read.
 fn to_phrase_key(bytes: Vec<u8>) -> Result<temple_vault::PhraseKey, TempleError> {
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| TempleError::InvalidKey("a phrase key is 32 bytes".into()))?;
+    let bytes = Zeroizing::new(bytes);
+    let bytes: [u8; 32] =
+        bytes.as_slice().try_into().map_err(|_| TempleError::InvalidKey("a phrase key is 32 bytes".into()))?;
     Ok(temple_vault::PhraseKey::from_bytes(bytes))
 }
 

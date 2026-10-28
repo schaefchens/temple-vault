@@ -58,7 +58,7 @@ impl Space {
         let file = claim.file().clone();
         let store = Store::load(file.clone(), &block.master_key, block.first_zone)?;
         let mut space = Space::new(file, Some(claim), key, block, store);
-        space.db = Some(connect(&space.name, false)?);
+        space.db = Some(connect(&space.name, false, &space.store)?);
         let objects = objects::all_runs(space.db())?;
         {
             let mut store = space.store.lock().unwrap();
@@ -90,7 +90,7 @@ impl Space {
         let block = KeyBlock { inner_version: INNER_VERSION, generation: 1, master_key: Key::random(), first_zone };
         let store = Store::create(file.clone(), &block.master_key, first_zone, zones)?;
         let mut space = Space::new(file.clone(), claim, key, block, store);
-        space.db = Some(connect(&space.name, true)?);
+        space.db = Some(connect(&space.name, true, &space.store)?);
         {
             let mut store = space.store.lock().unwrap();
             store.finish_create()?;
@@ -129,22 +129,56 @@ impl Space {
     }
 
     /// New words for this space: its key blocks at the new words' slots, then the old ones
-    /// overwritten. A phrase key the app kept for quick unlock stops working.
+    /// overwritten. A phrase key the app kept for quick unlock stops working. Interrupted,
+    /// it leaves both words opening the space: changing to the same new words again, from the
+    /// old ones, finishes it – or [`Space::forget_words`] from the new ones. The master key
+    /// stays: whoever has the old words and a copy of the vault from before can still read
+    /// the space; rebuilding the vault gives it a fresh one.
     pub fn change_words(&mut self, words: &Words) -> Result<(), Error> {
         let key = PhraseKey::from_words(words);
-        if self.file.find_key_block(&key.wrapping_key(), key.slots())?.is_some() {
+        if key.as_bytes() == self.key.as_bytes()
+            || self.file.find_key_block(&key.wrapping_key(), key.slots())?.is_some_and(|block| !self.is_ours(&block))
+        {
             return Err(Error::WordsInUse);
         }
         self.block.generation += 1;
         self.claim_slots(&key)?;
         let old = std::mem::replace(&mut self.key, key);
-        let old_wrapping = old.wrapping_key();
-        for slot in old.slots() {
-            if KeyBlock::open(&old_wrapping, slot, &self.file.read_slot(slot)?).is_some() {
+        self.overwrite_slots_of(&old)?;
+        self.file.sync()
+    }
+
+    /// Words that open this space no more – after a word change a crash interrupted, say:
+    /// their key blocks overwritten. Whether they opened it; the words this space was opened
+    /// with are refused as `WordsInUse`.
+    pub fn forget_words(&mut self, words: &Words) -> Result<bool, Error> {
+        let key = PhraseKey::from_words(words);
+        if key.as_bytes() == self.key.as_bytes() {
+            return Err(Error::WordsInUse);
+        }
+        let forgotten = self.overwrite_slots_of(&key)?;
+        if forgotten {
+            self.file.sync()?;
+        }
+        Ok(forgotten)
+    }
+
+    /// Overwrites the slots of `key` that hold a key block of this space; whether any did.
+    fn overwrite_slots_of(&self, key: &PhraseKey) -> Result<bool, Error> {
+        let wrapping = key.wrapping_key();
+        let mut any = false;
+        for slot in key.slots() {
+            if KeyBlock::open(&wrapping, slot, &self.file.read_slot(slot)?).is_some_and(|block| self.is_ours(&block)) {
                 self.file.write_slot(slot, &random_slot())?;
+                any = true;
             }
         }
-        self.file.sync()
+        Ok(any)
+    }
+
+    /// Whether a key block opens this space.
+    fn is_ours(&self, block: &KeyBlock) -> bool {
+        block.master_key.as_bytes() == self.block.master_key.as_bytes() && block.first_zone == self.block.first_zone
     }
 
     /// Keeps only this space: the slot table is rewritten with this space's key blocks at its
@@ -191,6 +225,14 @@ impl Space {
             return Ok(());
         }
         self.closed = true;
+        // Even when locking panics: the registry would keep the store, and its keys, for good.
+        struct Unregister(String);
+        impl Drop for Unregister {
+            fn drop(&mut self) {
+                vfs::remove(&self.0);
+            }
+        }
+        let _unregister = Unregister(self.name.clone());
         let locked = match self.db.take() {
             Some(db) if self.ready => self.lock_database(db),
             Some(db) => {
@@ -200,7 +242,6 @@ impl Space {
             }
             None => Ok(()),
         };
-        vfs::remove(&self.name);
         self.claim = None;
         locked
     }
@@ -210,6 +251,8 @@ impl Space {
             self.store.lock().unwrap().read_only = true;
             return Err(Error::ChangedElsewhere);
         }
+        // From here on, only Temple's own SQL runs.
+        self.store.lock().unwrap().admin = true;
         // What the app left uncommitted is dropped: a transaction would keep the checkpoint
         // from finishing, and the log readable.
         let rolled_back = if db.is_autocommit() { Ok(()) } else { db.execute_batch("ROLLBACK") };
@@ -240,6 +283,14 @@ impl Space {
         db.close().map_err(|(_, e)| self.sql_error(e))?;
         self.store.lock().unwrap().finish_lock()?;
         self.file.renew_marker()
+    }
+
+    /// Temple's own SQL on its tables, which the guard refuses the app's.
+    pub(crate) fn as_temple<T>(&self, sql: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, Error> {
+        self.store.lock().unwrap().admin = true;
+        let result = sql(self.db());
+        self.store.lock().unwrap().admin = false;
+        self.sql(result)
     }
 
     /// SQLite's result, with its I/O errors told apart when another device opened the vault.
@@ -314,8 +365,8 @@ fn random_slot() -> [u8; SLOT] {
 
 /// Opens the space's database through Temple's VFS. A new one is set up without a journal –
 /// a crash then leaves only noise anyway – and switched to WAL mode, which writes its first
-/// page: SQLite drops a log whose database is empty.
-fn connect(name: &str, new: bool) -> Result<Connection, Error> {
+/// page: SQLite drops a log whose database is empty. Its log turns over as it grows.
+fn connect(name: &str, new: bool, store: &Arc<Mutex<Store>>) -> Result<Connection, Error> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let db = Connection::open_with_flags_and_vfs(name, flags, vfs::NAME)?;
     if new {
@@ -345,5 +396,8 @@ fn connect(name: &str, new: bool) -> Result<Connection, Error> {
         "PRAGMA synchronous = FULL; PRAGMA secure_delete = ON; PRAGMA wal_autocheckpoint = 0;
          PRAGMA temp_store = MEMORY; PRAGMA max_page_count = {MAX_PAGES};"
     ))?;
+    // After wal_autocheckpoint, which replaces the hook.
+    vfs::turn_over_log(&db, store);
+    vfs::guard_tables(&db, store);
     Ok(db)
 }

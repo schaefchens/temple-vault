@@ -30,12 +30,15 @@ self.onmessage = async ({ data }: MessageEvent<Call | Close>) => {
     const transfer = value instanceof Uint8Array ? [value.buffer as ArrayBuffer] : [];
     post({ id, value: refer(value) }, transfer);
   } catch (error) {
-    if (TempleError.is(error)) {
-      post({ id, error: { kind: error.kind, message: error.message } });
-    } else {
+    if (error instanceof WebAssembly.RuntimeError) {
       // A Rust panic, or a broken module: the instance can't be trusted any more.
       post({ fatal: String(error) });
       self.close();
+    } else if (TempleError.is(error)) {
+      post({ id, error: { kind: error.kind, message: error.message } });
+    } else {
+      // Something the page sent wrong, before it reached Temple: an error of its own call.
+      post({ id, error: { kind: 'InvalidArgument', message: error instanceof Error ? error.message : String(error) } });
     }
   }
 };

@@ -1,6 +1,7 @@
 // Notes on Temple: one vault in the app's documents, spaces opened by 12 words, notes in each
-// space's database with full-text search, files as objects. Leaving the app locks the space.
-// The link temple-demo://self-test runs Temple's self-test on this device instead.
+// space's database with full-text search, files as objects. Leaving the app locks the space,
+// and a cover hides it while the app isn't active. The link temple-demo://self-test offers
+// Temple's self-test on this device instead.
 
 import { TempleProvider, useExecute, useQuery, useVault, type VaultHandle } from '@schaefchens/temple-react';
 import { TempleError, temple, type Space } from '@schaefchens/temple-react-native';
@@ -42,13 +43,17 @@ export default function App() {
 function Demo() {
   const vault = useVault(VAULT);
   const { lock } = vault;
+  // Not active – the app switcher, a system sheet – the screen's snapshot shows only a cover.
+  const [active, setActive] = useState(AppState.currentState === 'active');
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (state) => {
+      setActive(state === 'active');
       if (state === 'background') void lock();
     });
     return () => subscription.remove();
   }, [lock]);
 
+  if (!active) return <View style={styles.cover} />;
   switch (vault.status) {
     case 'opening':
       return <Busy label="Opening the vault…" />;
@@ -269,11 +274,13 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
       <Button
         label="Attach sample file"
         onPress={() =>
-          run(async () => {
-            const bytes = sample(256 * 1024);
-            const object = await space.putObject(bytes);
-            await execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, `sample-${object}.bin`, bytes.length]);
-          })
+          run(() =>
+            transaction(space, async () => {
+              const bytes = sample(256 * 1024);
+              const object = await space.putObject(bytes);
+              await execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, `sample-${object}.bin`, bytes.length]);
+            }),
+          )
         }
       />
       {files.rows.map((file) => (
@@ -294,10 +301,12 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
           <Button
             label="Remove"
             onPress={() =>
-              run(async () => {
-                await space.deleteObject(file.object);
-                await execute('DELETE FROM file WHERE id = ?', [file.id]);
-              })
+              run(() =>
+                transaction(space, async () => {
+                  await space.deleteObject(file.object);
+                  await execute('DELETE FROM file WHERE id = ?', [file.id]);
+                }),
+              )
             }
           />
         </View>
@@ -310,7 +319,9 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
             const key = toHex(await space.phraseKey());
             await SecureStore.setItemAsync(KEY, key, { requireAuthentication: true });
             await SecureStore.setItemAsync(HAS_KEY, '1');
-            setNotice('Quick unlock is on: the key sits behind your biometrics or passcode.');
+            setNotice(
+              'Quick unlock is on: the key sits behind your biometrics or passcode, and opens this space for whoever passes them – keep it for your everyday space.',
+            );
           })
         }
       />
@@ -324,8 +335,22 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
   );
 }
 
-/** Temple's self-test on this device, for the E2E run: temple-demo://self-test. */
+/** Temple's self-test on this device, for the E2E run: temple-demo://self-test – once asked for here: a link alone could start it, and it writes two vaults of some hundred megabytes. */
 function SelfTest() {
+  const [asked, setAsked] = useState(false);
+  if (!asked) {
+    return (
+      <View style={styles.card}>
+        <Text style={styles.title}>Self-test</Text>
+        <Text>Runs Temple's checks on this device: two vaults of some hundred megabytes, deleted at the end.</Text>
+        <Button label="Run self-test" onPress={() => setAsked(true)} />
+      </View>
+    );
+  }
+  return <SelfTestRun />;
+}
+
+function SelfTestRun() {
   const [checks, setChecks] = useState<Check[]>([]);
   const [done, setDone] = useState(false);
   useEffect(() => {
@@ -371,6 +396,18 @@ function Button({ label, onPress }: { label: string; onPress(): void }) {
   );
 }
 
+/** Runs statements in one transaction, rolled back if one fails: an object and its row go together. */
+async function transaction(space: Space, work: () => Promise<void>) {
+  await space.execute('BEGIN');
+  try {
+    await work();
+    await space.execute('COMMIT');
+  } catch (error) {
+    await space.execute('ROLLBACK').catch(() => {});
+    throw error;
+  }
+}
+
 /** A file path in the app's documents, as Temple takes it. */
 function documentPath(name: string): string {
   return decodeURIComponent(new File(Paths.document, name).uri.replace(/^file:\/\//, ''));
@@ -410,6 +447,7 @@ function message(error: unknown): string {
 
 const styles = StyleSheet.create({
   screen: { flex: 1 },
+  cover: { flex: 1, backgroundColor: '#2f6fde' },
   card: { padding: 16, gap: 12 },
   row: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   title: { fontSize: 22, fontWeight: '600' },

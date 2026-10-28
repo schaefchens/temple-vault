@@ -40,17 +40,17 @@ pub struct Setup {
 
 impl Vault {
     /// A new vault at `path` with its first space, which comes back open. Fails if something
-    /// exists at `path`. The vault is written next to it, as `.<name>.part`, and given its name
-    /// once complete, so a crash leaves no half-made vault at `path`; the next try removes
-    /// what it left.
+    /// exists at `path`. The vault is written next to it, as `.<name>.temple-part`, and given
+    /// its name once complete, so a crash leaves no half-made vault at `path`; the next try
+    /// removes what it left.
     #[cfg(unix)]
     pub fn create(path: impl AsRef<Path>, words: &Words, setup: Setup) -> Result<(Vault, Space), Error> {
         let key = PhraseKey::from_words(words);
         Vault::create_at(path.as_ref(), noise::REAL, |file| Space::create(file, file.claim(), key, setup, true))
     }
 
-    /// A new vault at `path`, filled by `fill` in `.<name>.part` next to it and given its name
-    /// once complete.
+    /// A new vault at `path`, filled by `fill` in `.<name>.temple-part` next to it and given its
+    /// name once complete.
     #[cfg(unix)]
     pub(crate) fn create_at<T>(
         path: &Path,
@@ -59,16 +59,22 @@ impl Vault {
     ) -> Result<(Vault, T), Error> {
         let name =
             path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a vault needs a file name"))?;
-        let partial = path.with_file_name(format!(".{}.part", name.to_string_lossy()));
-        // Left by a creation a crash interrupted: never a vault, as it never got its name.
-        match fs::remove_file(&partial) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
-        }
         if fs::symlink_metadata(path).is_ok() {
             return Err(already_exists().into());
         }
+        let partial = path.with_file_name(format!(".{}.temple-part", name.to_string_lossy()));
+        // Left by a creation a crash interrupted – never a vault, as it never got its name –
+        // unless another process is still writing it.
+        match OpenOptions::new().write(true).open(&partial) {
+            Ok(left) => {
+                hold(&left)?;
+                fs::remove_file(&partial)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let file = OpenOptions::new().read(true).write(true).create_new(true).open(&partial)?;
+        hold(&file)?;
         let device = Arc::new(FileDevice::new(file, &partial));
         let created = Vault::create_on(device.clone(), noise, fill).and_then(|(vault, filled)| {
             device.publish(path)?;
@@ -96,11 +102,17 @@ impl Vault {
         Ok((Vault { file }, filled))
     }
 
-    /// Opens a vault. Writes nothing but the opening marker until a space opens.
+    /// Opens a vault, writing nothing – no file tells a vault from other data, so a file that
+    /// isn't one stays as it was. The opening marker is written once a space opens or is
+    /// created there, or a space is copied in. Creating a space writes into any file: only for
+    /// vaults.
+    /// Another process with the vault open – an app's extension, say – makes it fail with
+    /// `ResourceBusy`.
     #[cfg(unix)]
     pub fn open(path: impl AsRef<Path>) -> Result<Vault, Error> {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        hold(&file)?;
         Vault::open_on(Arc::new(FileDevice::new(file, path)), noise::REAL)
     }
 
@@ -130,13 +142,12 @@ impl Vault {
         if device.len()? < 2 * ZONE {
             return Err(Error::NotAVault);
         }
-        let file = Arc::new(VaultFile::new(device, noise));
-        file.take_over()?;
-        Ok(Vault { file })
+        Ok(Vault { file: Arc::new(VaultFile::new(device, noise)) })
     }
 
-    /// The space these words open, or `None` if they open none – the same work either way.
-    /// Unknown words with a valid checksum can become a new space: [`Vault::create_space`].
+    /// The space these words open, or `None` if they open none – the same work either way,
+    /// and nothing written for words that open none. Unknown words with a valid checksum can
+    /// become a new space: [`Vault::create_space`].
     pub fn unlock(&self, words: &Words) -> Result<Option<Space>, Error> {
         self.unlock_with_key(&PhraseKey::from_words(words))
     }
@@ -145,7 +156,10 @@ impl Vault {
     pub fn unlock_with_key(&self, key: &PhraseKey) -> Result<Option<Space>, Error> {
         let claim = self.file.claim().ok_or(Error::SpaceOpen)?;
         match self.file.find_key_block(&key.wrapping_key(), key.slots())? {
-            Some(block) => Space::open(claim, key.duplicate(), block).map(Some),
+            Some(block) => {
+                self.file.take_over()?;
+                Space::open(claim, key.duplicate(), block).map(Some)
+            }
             None => Ok(None),
         }
     }
@@ -159,6 +173,7 @@ impl Vault {
         if self.file.find_key_block(&key.wrapping_key(), key.slots())?.is_some() {
             return Err(Error::WordsInUse);
         }
+        self.file.take_over()?;
         Space::create(&self.file, Some(claim), key, setup, false)
     }
 }
@@ -168,8 +183,22 @@ pub(crate) fn already_exists() -> io::Error {
     io::Error::new(io::ErrorKind::AlreadyExists, "something exists at the vault's path")
 }
 
-/// The vault file as the spaces see it. Before the first write after each sync, it checks
-/// the opening marker; if another device has opened the vault, it stops writing for good.
+/// An exclusive lock on the vault's file while it is open, so that a second process can't
+/// write beside this one between the opening marker's checks. Where the file system has no
+/// locks, the marker alone tells.
+#[cfg(unix)]
+fn hold(file: &fs::File) -> Result<(), Error> {
+    match file.try_lock() {
+        Err(fs::TryLockError::WouldBlock) => {
+            Err(io::Error::new(io::ErrorKind::ResourceBusy, "another process has the vault open").into())
+        }
+        Ok(()) | Err(fs::TryLockError::Error(_)) => Ok(()),
+    }
+}
+
+/// The vault file as the spaces see it. Before the first write after the opening marker and
+/// after each sync, it checks the marker; if another device has opened a space of the vault
+/// since, it stops writing for good.
 pub(crate) struct VaultFile {
     device: Arc<dyn Device>,
     pub(crate) noise: noise::Amounts,
@@ -233,13 +262,17 @@ impl VaultFile {
         Ok(first)
     }
 
-    /// Opening the vault: a fresh opening marker, synced.
+    /// A space opens, is created or copied in, or locks: a fresh opening marker, synced – and
+    /// read back before the next write, in case another device takes over in between.
     pub(crate) fn take_over(&self) -> Result<(), Error> {
+        if self.stopped() {
+            return Err(Error::ChangedElsewhere);
+        }
         let mut marker = self.marker.lock().unwrap();
         random(&mut marker.bytes);
         self.device.write_at(&marker.bytes, MARKER)?;
         self.device.sync()?;
-        marker.check_due = false;
+        marker.check_due = true;
         Ok(())
     }
 

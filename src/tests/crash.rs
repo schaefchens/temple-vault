@@ -6,7 +6,7 @@
 //! in parallel, or front to back, as most copies are read.
 
 use super::memory::{Event, Memory};
-use super::{SMALL_NOISE, create_on, phrase};
+use super::{SMALL_NOISE, create_on, phrase, readable};
 use crate::keys::PhraseKey;
 use crate::vault::{Setup, Vault};
 use crate::{BLOCK, Space};
@@ -232,14 +232,18 @@ struct Session {
 }
 
 fn session(commits: usize, then_lock: bool) -> Session {
-    seeded_session(0x5eed, commits, then_lock)
+    seeded_session(0x5eed, commits, then_lock, false)
 }
 
-fn seeded_session(seed: u64, commits: usize, then_lock: bool) -> Session {
+/// With `turning_over`, the log turns over every 64 KiB: every few commits.
+fn seeded_session(seed: u64, commits: usize, then_lock: bool, turning_over: bool) -> Session {
     let mut work = Workload::new(seed);
     let (memory, vault) = vault_with(&mut work);
     let mut states = vec![work.state.clone()];
     let space = vault.unlock_with_key(&phrase(0).1).unwrap().unwrap();
+    if turning_over {
+        space.store().set_log_limit(Some(64 << 10));
+    }
     memory.record();
     let (mut starts, mut ends) = (Vec::new(), Vec::new());
     for _ in 0..commits {
@@ -496,9 +500,12 @@ fn no_commit_rewrites_a_durable_log_block() {
 #[ignore]
 fn soak() {
     let mut rng = Rng(0x50a4);
-    let (mut crashes, mut copies, mut failed) = (0, 0, 0);
+    // Copies that didn't open: in sessions as they are, and in sessions whose log turns over
+    // every few commits – as often as 4 MiB of log never does.
+    let (mut crashes, mut copies, mut failed) = (0, 0, [0, 0]);
     for seed in 1..=40 {
-        let Session { recording, states, starts, ends } = seeded_session(seed, 20, true);
+        let turning_over = seed % 2 == 0;
+        let Session { recording, states, starts, ends } = seeded_session(seed, 20, true, turning_over);
         let last_commit = *ends.last().unwrap();
         for _ in 0..200 {
             let at = rng.below(recording.events.len() + 1);
@@ -524,13 +531,16 @@ fn soak() {
                 Ok(found) => {
                     assert!(states[first..].contains(&found), "seed {seed}: a copy opened to a state no commit had")
                 }
-                Err(_) if to > last_commit => failed += 1,
+                Err(_) if to > last_commit => failed[usize::from(turning_over)] += 1,
                 Err(e) => panic!("seed {seed}: {e}"),
             }
             copies += 1;
         }
     }
-    eprintln!("{crashes} crashes, {copies} copies ({failed} spanning a lock didn't open)");
+    let [plain, turning] = failed;
+    eprintln!(
+        "{crashes} crashes, {copies} copies: spanning a lock, {plain} of 1000 didn't open, {turning} of 1000 with turnovers"
+    );
 }
 
 /// From the review: if the tag table needs room when a full space locks, the space grows –
@@ -564,6 +574,8 @@ fn a_crash_while_a_nearly_full_space_locks_keeps_the_newest_state() {
     let mut work = Workload::new(32);
     let (memory, vault) = vault_with(&mut work);
     let space = vault.unlock_with_key(&phrase(0).1).unwrap().unwrap();
+    // A log that turns over gives its blocks back; this one must take the last ones.
+    space.store().set_log_limit(None);
     work.commit(&space);
     let free = space.store().free_blocks() as usize;
     space.put_object(&vec![9u8; (free - 10) * crate::space::PAYLOAD_BYTES][..]).unwrap();
@@ -608,4 +620,122 @@ fn a_copy_after_an_object_was_deleted_opens() {
         let found = open_state(recording.random_copy(0, recording.events.len(), &mut rng), &phrase(0).1);
         assert!(found.as_ref().is_ok_and(|found| states.contains(found)), "{:?}", found.err());
     }
+}
+
+/// From the review: when a lock's checkpoint shrinks the database – here after VACUUM – the
+/// blocks it cuts off still hold the pages from before the session's deletes. A crash at any
+/// write of the lock leaves none of them readable once the space has locked again.
+#[test]
+fn a_crash_while_a_shrinking_database_locks_leaves_nothing_deleted() {
+    let memory = Memory::new();
+    let (vault, space) = create_on(&memory, 0, Setup::default());
+    space.db().execute_batch("CREATE TABLE kv (k INTEGER PRIMARY KEY, v TEXT NOT NULL)").unwrap();
+    let tx = space.db().unchecked_transaction().unwrap();
+    for k in 0..100 {
+        tx.execute("INSERT INTO kv VALUES (?1, ?2)", (k, "<deleted>".repeat(300))).unwrap();
+    }
+    tx.commit().unwrap();
+    space.lock().unwrap();
+    let space = vault.unlock_with_key(&phrase(0).1).unwrap().unwrap();
+    space.db().execute_batch("DELETE FROM kv; VACUUM;").unwrap();
+    let key = space.master_key().derive(b"temple/v1/db");
+    memory.record();
+    space.lock().unwrap();
+    let recording = Recording::of(&memory);
+    let mut rng = Rng(51);
+    for at in 0..=recording.events.len() {
+        let image = Memory::with_bytes(recording.crash(at, &mut rng));
+        let vault = Vault::open_on(image.clone(), SMALL_NOISE).unwrap();
+        let space = vault.unlock_with_key(&phrase(0).1).unwrap().expect("the space");
+        assert_eq!(state(&space), Ok(State::new()), "crash at {at}");
+        space.lock().unwrap();
+        assert!(!readable(&image.bytes(), &[key.duplicate()]).contains("<deleted>"), "crash at {at}");
+    }
+}
+
+/// A log that turns over – here every few commits – keeps every durable commit through a
+/// crash at any write, the turnovers' own writes included.
+#[test]
+fn a_crash_while_the_log_turns_over_keeps_every_durable_commit() {
+    let Session { recording, states, starts, ends } = seeded_session(0x70, 30, false, true);
+    let mut rng = Rng(61);
+    for _ in 0..300 {
+        let at = rng.below(recording.events.len() + 1);
+        let durable = ends.iter().filter(|&&end| end <= at).count();
+        let begun = starts.iter().filter(|&&start| start < at).count();
+        let found = open_state(recording.crash(at, &mut rng), &phrase(0).1);
+        let found = found.unwrap_or_else(|e| panic!("crash at {at}: {e}"));
+        assert!(states[durable..=begun].contains(&found), "crash at {at}: a state no commit had");
+    }
+}
+
+/// Copies taken while the log turns over behave as copies taken across commits and a lock:
+/// read front to back, they open to a state the space had. In random order they may hold a
+/// page the turnover's checkpoint wrote beside a log from before it; that page then fails
+/// when read. Never does a copy open to a state the space didn't have.
+#[test]
+fn a_copy_while_the_log_turns_over_opens_to_a_state_it_had() {
+    let Session { recording, states, starts, ends } = seeded_session(0x71, 30, false, true);
+    let mut rng = Rng(62);
+    let mut failed = 0;
+    for _ in 0..4 {
+        for first in 0..starts.len() {
+            let (from, to) = (starts[first], ends[first]);
+            let window = &states[first..=first + 1];
+            let found = open_state(recording.sequential_copy(from, to, &mut rng), &phrase(0).1);
+            assert!(found.as_ref().is_ok_and(|found| window.contains(found)), "commit {first}: {:?}", found.err());
+            match open_state(recording.random_copy(from, to, &mut rng), &phrase(0).1) {
+                Ok(found) => assert!(window.contains(&found), "commit {first}: a state no commit had"),
+                // A page that isn't the one the tag table holds: SQLITE_IOERR_READ, which an
+                // integrity check reports as a page it couldn't get.
+                Err(e) => {
+                    let unread = ["error code=266", "failed to get page", "disk I/O error"];
+                    assert!(unread.iter().any(|unread| e.contains(unread)), "commit {first}: {e}");
+                    failed += 1;
+                }
+            }
+        }
+    }
+    // 23 of 120 when last run: here every copy spans a turnover, at 64 KiB of log instead of 4 MiB.
+    assert!(failed < 40, "{failed} of 120");
+}
+
+/// From the review: a word change interrupted once the new key blocks were durable left the
+/// old words working, and nothing but keeping only this space undid that. Changing to the
+/// same new words again from the old ones finishes it, and so does forgetting the old words
+/// from the new ones.
+#[test]
+fn an_interrupted_word_change_can_be_finished() {
+    let mut work = Workload::new(14);
+    let (memory, vault) = vault_with(&mut work);
+    let mut space = vault.unlock_with_key(&phrase(0).1).unwrap().unwrap();
+    memory.record();
+    space.change_words(&phrase(1).0).unwrap();
+    space.lock().unwrap();
+    let recording = Recording::of(&memory);
+    let new_blocks_durable = recording.events.iter().position(|event| matches!(event, Event::Sync)).unwrap() + 1;
+    let crashed = || {
+        let image = recording.crash(new_blocks_durable, &mut Rng(1));
+        Vault::open_on(Memory::with_bytes(image), SMALL_NOISE).unwrap()
+    };
+    let opens = |vault: &Vault, n: usize| vault.unlock_with_key(&phrase(n).1).unwrap().is_some();
+
+    let vault = crashed();
+    assert!(opens(&vault, 0) && opens(&vault, 1));
+    let mut space = vault.unlock_with_key(&phrase(0).1).unwrap().unwrap();
+    space.change_words(&phrase(1).0).unwrap();
+    space.lock().unwrap();
+    assert!(!opens(&vault, 0) && opens(&vault, 1));
+
+    let vault = crashed();
+    let mut space = vault.unlock_with_key(&phrase(1).1).unwrap().unwrap();
+    assert!(matches!(space.change_words(&phrase(1).0), Err(crate::Error::WordsInUse)));
+    assert!(matches!(space.forget_words(&phrase(1).0), Err(crate::Error::WordsInUse)));
+    assert!(space.forget_words(&phrase(0).0).unwrap());
+    assert!(!space.forget_words(&phrase(0).0).unwrap());
+    // Words of another space aren't this space's to forget.
+    assert!(!space.forget_words(&phrase(2).0).unwrap());
+    space.lock().unwrap();
+    assert!(!opens(&vault, 0) && opens(&vault, 1));
+    assert_eq!(open_state(recording.crash(new_blocks_durable, &mut Rng(1)), &phrase(1).1), Ok(work.state.clone()));
 }

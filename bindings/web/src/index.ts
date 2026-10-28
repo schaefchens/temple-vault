@@ -58,10 +58,20 @@ class Remote {
 
 const remote = new Remote();
 
+/** What the page lets go of without closing or locking it, the worker closes or locks once it's collected – as React Native's garbage collection does. */
+const vaultsLetGo = new FinalizationRegistry<{ handle: number; generation: number }>(({ handle, generation }) =>
+  remote.close(handle, generation),
+);
+const spacesLetGo = new FinalizationRegistry<{ handle: number; generation: number }>(({ handle, generation }) => {
+  remote.call(handle, 'lock', [], generation).catch(() => {});
+});
+
 class RemoteVault implements Vault {
   readonly generation = remote.generation;
 
-  constructor(readonly handle: number) {}
+  constructor(readonly handle: number) {
+    vaultsLetGo.register(this, { handle, generation: this.generation }, this);
+  }
 
   #call<T>(method: string, ...args: unknown[]) {
     return remote.call<T>(this.handle, method, args, this.generation);
@@ -80,6 +90,7 @@ class RemoteVault implements Vault {
   }
 
   close() {
+    vaultsLetGo.unregister(this);
     remote.close(this.handle, this.generation);
   }
 }
@@ -87,8 +98,11 @@ class RemoteVault implements Vault {
 class RemoteSpace implements Space {
   readonly generation = remote.generation;
   #locked = false;
+  #locking: Promise<void> | null = null;
 
-  constructor(readonly handle: number) {}
+  constructor(readonly handle: number) {
+    spacesLetGo.register(this, { handle, generation: this.generation }, this);
+  }
 
   #call<T>(method: string, ...args: unknown[]) {
     if (this.#locked) return Promise.reject(new TempleError('Locked', 'the space has locked'));
@@ -135,6 +149,10 @@ class RemoteSpace implements Space {
     return this.#call<void>('changeWords', words);
   }
 
+  forgetWords(words: number[]) {
+    return this.#call<boolean>('forgetWords', words);
+  }
+
   keepOnlyThis() {
     return this.#call<void>('keepOnlyThis');
   }
@@ -144,18 +162,23 @@ class RemoteSpace implements Space {
   }
 
   async copyInto(target: Vault) {
-    if (!(target instanceof RemoteVault)) throw new TempleError('NotFound', 'not a vault of this Temple');
+    // A vault from before the worker restarted: its number may name another vault now.
+    if (!(target instanceof RemoteVault) || target.generation !== remote.generation) {
+      throw new TempleError('NotFound', 'not a vault of this Temple – open it again');
+    }
     return this.#call<void>('copyInto', { vault: target.handle });
   }
 
-  /** Even when locking fails – another device opened the vault – the space is closed. */
-  async lock() {
-    if (this.#locked) return;
-    try {
-      await this.#call<void>('lock');
-    } finally {
-      this.#locked = true;
+  /** Even when locking fails – another device opened the vault – the space is closed. Calls while it locks share that lock. */
+  lock() {
+    if (!this.#locked && !this.#locking) {
+      spacesLetGo.unregister(this);
+      this.#locking = this.#call<void>('lock').finally(() => {
+        this.#locked = true;
+        this.#locking = null;
+      });
     }
+    return this.#locking ?? Promise.resolve();
   }
 
   async isLocked() {

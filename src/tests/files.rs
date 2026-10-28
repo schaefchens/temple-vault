@@ -45,7 +45,7 @@ fn a_creation_a_crash_interrupted_leaves_nothing_behind() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reading");
     // What an interrupted creation left: a part, never a vault.
-    fs::write(dir.path().join(".reading.part"), vec![1u8; 4 << 20]).unwrap();
+    fs::write(dir.path().join(".reading.temple-part"), vec![1u8; 4 << 20]).unwrap();
     let (_vault, space) = create(&path);
     space.lock().unwrap();
     let names: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
@@ -117,4 +117,59 @@ fn objects_throughput() {
     }
     let read = clock.elapsed();
     eprintln!("200 MB: written in {written:?}, read in 1 MB pieces in {read:?}");
+}
+
+/// From the review: SQLite read `file:` URIs, so the app's SQL could attach a database in the
+/// clear outside the vault, or VACUUM INTO one. Names are only names now; VACUUM still works.
+#[test]
+fn sql_writes_no_file_outside_the_vault() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_vault, space) = create(&dir.path().join("reading"));
+    space.db().execute_batch("CREATE TABLE note (body TEXT); INSERT INTO note VALUES ('kept');").unwrap();
+    let plain = dir.path().join("plain.db");
+    let uri = format!("file:{}?vfs=unix", plain.display());
+    assert!(space.db().execute_batch(&format!("ATTACH '{uri}' AS plain")).is_err());
+    assert!(space.db().execute_batch(&format!("VACUUM INTO '{uri}'")).is_err());
+    assert!(space.db().execute_batch(&format!("VACUUM INTO '{}'", plain.display())).is_err());
+    assert!(!plain.exists());
+    space.db().execute_batch("VACUUM").unwrap();
+    let body: String = space.db().query_row("SELECT body FROM note", [], |row| row.get(0)).unwrap();
+    assert_eq!(body, "kept");
+}
+
+/// From the review: opening wrote the opening marker at once – 4 KiB at 1 MiB of whatever
+/// file it was given, as no file tells a vault from other data. Opening writes nothing now,
+/// and neither do words that open no space.
+#[test]
+fn opening_a_file_that_isnt_a_vault_leaves_it_as_it_was() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("photo.jpg");
+    let original: Vec<u8> = (0..3u32 << 20).map(|i| (i % 251) as u8).collect();
+    fs::write(&path, &original).unwrap();
+    let vault = Vault::open(&path).unwrap();
+    assert!(vault.unlock_with_key(&phrase(0).1).unwrap().is_none());
+    drop(vault);
+    assert!(fs::read(&path).unwrap() == original);
+}
+
+/// From the review: creating a vault removed `.<name>.part` unconditionally, and nothing kept
+/// a second process from writing beside the first. A vault's file is locked while open now:
+/// a creation still running elsewhere keeps its part, and a second opener is refused.
+#[test]
+fn a_vault_open_elsewhere_is_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reading");
+    let partial = dir.path().join(".reading.temple-part");
+    let elsewhere = fs::File::create(&partial).unwrap();
+    elsewhere.lock().unwrap();
+    let busy = |result: Result<Vault, Error>| matches!(result, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::ResourceBusy);
+    assert!(busy(Vault::create(&path, &phrase(0).0, Setup::default()).map(|(vault, _)| vault)));
+    assert!(partial.exists());
+    drop(elsewhere);
+
+    let (vault, space) = create(&path);
+    space.lock().unwrap();
+    assert!(busy(Vault::open(&path)));
+    drop(vault);
+    assert!(Vault::open(&path).unwrap().unlock_with_key(&phrase(0).1).unwrap().is_some());
 }

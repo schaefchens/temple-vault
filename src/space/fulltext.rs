@@ -3,51 +3,61 @@
 
 use rusqlite::Connection;
 
-/// Turns `secure-delete` on for every FTS5 table that doesn't have it yet, and merges away
-/// what deletions left in its index so far. Run when a space locks.
+/// The FTS5 tables Temple has cleared, by name and the root page of their data: a table made
+/// anew under an old name counts as new.
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS temple_fulltext (
+    name TEXT NOT NULL,
+    data INTEGER NOT NULL,
+    PRIMARY KEY (name, data)
+) STRICT";
+
+/// Turns `secure-delete` on for every FTS5 table. The first time Temple sees a table – and
+/// whoever turned the option on – it merges away what deletions left in the index so far.
+/// Run as Temple, when a space locks.
 pub(super) fn forget_deleted(db: &Connection) -> rusqlite::Result<()> {
-    let tables: Vec<(String, String)> = db
-        .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND sql LIKE 'CREATE VIRTUAL TABLE%'")?
+    // Known by FTS5's own tables, not by the text that made it: its configuration names its
+    // version.
+    let tables: Vec<(String, i64)> = db
+        .prepare(
+            "SELECT t.name, d.rootpage FROM sqlite_schema AS t
+             JOIN sqlite_schema AS d ON d.type = 'table' AND d.name = t.name || '_data'
+             WHERE t.type = 'table' AND t.sql LIKE 'CREATE VIRTUAL TABLE%'
+               AND EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = t.name || '_idx')
+               AND EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = t.name || '_config')",
+        )?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<Result<_, _>>()?;
-    for (name, _) in tables.iter().filter(|(_, sql)| uses_fts5(sql)) {
-        let config = quote(&format!("{name}_config"));
-        let on: bool = db.query_row(
-            &format!("SELECT count(*) > 0 FROM {config} WHERE k = 'secure-delete' AND CAST(v AS INTEGER) = 1"),
-            [],
+    if tables.is_empty() {
+        return Ok(());
+    }
+    db.execute_batch(SCHEMA)?;
+    for (name, data) in &tables {
+        let (table, config) = (quote(name), quote(&format!("{name}_config")));
+        let setting = |key: &str| format!("SELECT count(*) > 0 FROM {config} WHERE k = '{key}'");
+        if !db.query_row(&setting("version"), [], |row| row.get::<_, bool>(0))? {
+            continue;
+        }
+        let on: bool =
+            db.query_row(&format!("{} AND CAST(v AS INTEGER) = 1", setting("secure-delete")), [], |row| row.get(0))?;
+        let cleared: bool = db.query_row(
+            "SELECT count(*) > 0 FROM temple_fulltext WHERE name = ?1 AND data = ?2",
+            (name, data),
             |row| row.get(0),
         )?;
         if !on {
-            let table = quote(name);
             db.execute(&format!("INSERT INTO {table} ({table}, rank) VALUES ('secure-delete', 1)"), [])?;
+        }
+        if !on || !cleared {
             db.execute(&format!("INSERT INTO {table} ({table}) VALUES ('optimize')"), [])?;
+            db.execute("INSERT OR IGNORE INTO temple_fulltext VALUES (?1, ?2)", (name, data))?;
         }
     }
-    Ok(())
-}
-
-/// Whether a `CREATE VIRTUAL TABLE` statement names the module fts5.
-fn uses_fts5(sql: &str) -> bool {
-    let mut words = sql.split(|c: char| c.is_whitespace() || c == '(').filter(|word| !word.is_empty());
-    words.any(|word| word.eq_ignore_ascii_case("using"))
-        && words.next().is_some_and(|word| word.eq_ignore_ascii_case("fts5"))
+    db.execute_batch(
+        "DELETE FROM temple_fulltext WHERE NOT EXISTS (SELECT 1 FROM sqlite_schema
+             WHERE type = 'table' AND name = temple_fulltext.name || '_data' AND rootpage = temple_fulltext.data)",
+    )
 }
 
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-    use wasm_bindgen_test::wasm_bindgen_test as test;
-
-    #[test]
-    fn recognizes_fts5_tables() {
-        assert!(uses_fts5("CREATE VIRTUAL TABLE verse USING fts5(body)"));
-        assert!(uses_fts5("CREATE VIRTUAL TABLE \"my verse\"\nUSING FTS5 (body, tokenize = 'unicode61')"));
-        assert!(!uses_fts5("CREATE VIRTUAL TABLE old USING fts4(body)"));
-        assert!(!uses_fts5("CREATE VIRTUAL TABLE \"using\" USING rtree(id, a, b)"));
-    }
 }

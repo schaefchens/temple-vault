@@ -6,12 +6,12 @@
 use super::heap;
 use super::store::{File, PAYLOAD, Store};
 use crate::{BLOCK, Error};
-use rusqlite::ffi;
+use rusqlite::{Connection, ffi};
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io;
 use std::ptr;
 use std::slice;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use zeroize::Zeroizing;
 
 pub(crate) const NAME: &CStr = c"temple";
@@ -38,10 +38,11 @@ const GUARDED: &[&str] = &[
 /// The open spaces' stores, by the name their database was opened under.
 static STORES: Mutex<Vec<(String, Arc<Mutex<Store>>)>> = Mutex::new(Vec::new());
 
-/// Installs SQLite's wiping heap and registers the VFS, once per process.
+/// Installs SQLite's wiping heap, turns off URI filenames and registers the VFS, once per
+/// process.
 pub(crate) fn install() -> Result<(), Error> {
     static INSTALLED: OnceLock<bool> = OnceLock::new();
-    if *INSTALLED.get_or_init(|| heap::install() && register()) {
+    if *INSTALLED.get_or_init(|| heap::install() && names_only() && register()) {
         Ok(())
     } else {
         Err(io::Error::other(
@@ -51,10 +52,17 @@ pub(crate) fn install() -> Result<(), Error> {
     }
 }
 
+/// Filenames as plain names, where rusqlite's bundled SQLite would read `file:` URIs: through
+/// one naming another VFS, the app's SQL could attach a database outside the vault. Opening
+/// with `SQLITE_OPEN_URI`, as rusqlite does by default, still gets URIs elsewhere.
+fn names_only() -> bool {
+    unsafe { ffi::sqlite3_config(ffi::SQLITE_CONFIG_URI, 0 as c_int) == ffi::SQLITE_OK }
+}
+
 /// Makes a store available to SQLite under a fresh random name, which the app's SQL can't
 /// guess.
 pub(crate) fn add(store: Arc<Mutex<Store>>) -> String {
-    let mut stores = STORES.lock().unwrap();
+    let mut stores = stores();
     loop {
         let mut bytes = [0u8; 8];
         crate::crypto::random(&mut bytes);
@@ -67,11 +75,17 @@ pub(crate) fn add(store: Arc<Mutex<Store>>) -> String {
 }
 
 pub(crate) fn remove(name: &str) {
-    STORES.lock().unwrap().retain(|(n, _)| n != name);
+    stores().retain(|(n, _)| n != name);
 }
 
 fn find(name: &str) -> Option<Arc<Mutex<Store>>> {
-    STORES.lock().unwrap().iter().find(|(n, _)| n == name).map(|(_, store)| store.clone())
+    stores().iter().find(|(n, _)| n == name).map(|(_, store)| store.clone())
+}
+
+/// The registry, even after a panic elsewhere: it only maps names to stores, and a panic in
+/// SQLite's callbacks would end the process.
+fn stores() -> MutexGuard<'static, Vec<(String, Arc<Mutex<Store>>)>> {
+    STORES.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -153,14 +167,26 @@ unsafe extern "C" fn x_open(
     } else {
         let Ok(name) = unsafe { CStr::from_ptr(name) }.to_str() else { return ffi::SQLITE_CANTOPEN };
         let (base, kind) = split(name);
+        // A file only in the role its name gives it, so that SQL can't attach a space's log
+        // as a database.
+        let role = match kind {
+            Kind::Database => ffi::SQLITE_OPEN_MAIN_DB,
+            Kind::Log => ffi::SQLITE_OPEN_WAL,
+            Kind::Memory => ffi::SQLITE_OPEN_MAIN_JOURNAL,
+        };
+        if flags & role == 0 {
+            return ffi::SQLITE_CANTOPEN;
+        }
         let Some(store) = find(base) else { return ffi::SQLITE_CANTOPEN };
-        if kind == Kind::Database {
-            // One connection at a time: locking is left out, so a second one would corrupt.
+        if kind != Kind::Memory {
+            // One connection at a time, with one log: locking is left out, so a second one
+            // would corrupt.
             let Ok(mut store) = store.lock() else { return ffi::SQLITE_CANTOPEN };
-            if store.database_open {
-                return ffi::SQLITE_CANTOPEN;
+            match kind {
+                Kind::Database if !store.database_open => store.database_open = true,
+                Kind::Log if store.database_open && !store.log_open => store.log_open = true,
+                _ => return ffi::SQLITE_CANTOPEN,
             }
-            store.database_open = true;
         }
         (kind, if kind == Kind::Memory { ptr::null() } else { Arc::into_raw(store) })
     };
@@ -179,10 +205,12 @@ unsafe extern "C" fn x_close(file: *mut ffi::sqlite3_file) -> c_int {
         drop(unsafe { Box::from_raw(h.memory) });
     }
     if !h.store.is_null() {
-        if h.kind == Kind::Database
-            && let Some(mut store) = h.store()
-        {
-            store.database_open = false;
+        if let Some(mut store) = h.store() {
+            match h.kind {
+                Kind::Database => store.database_open = false,
+                Kind::Log => store.log_open = false,
+                Kind::Memory => {}
+            }
         }
         drop(unsafe { Arc::from_raw(h.store) });
     }
@@ -404,6 +432,77 @@ fn unix_seconds() -> f64 {
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 fn unix_seconds() -> f64 {
     js_sys::Date::now() / 1000.0
+}
+
+/// Turns the log of `db` over whenever it's due after a commit ([`Store::log_due`]). Through
+/// SQLite's own interface rather than rusqlite's `wal_hook`, whose feature would also hand the
+/// app a checkpoint call around the guard.
+pub(crate) fn turn_over_log(db: &Connection, store: &Arc<Mutex<Store>>) {
+    // The space holds `store` for as long as `db` is open.
+    unsafe { ffi::sqlite3_wal_hook(db.handle(), Some(x_wal_hook), Arc::as_ptr(store) as *mut c_void) };
+}
+
+/// A commit has ended. The checkpoint empties the log only if it copied all of it; the commit
+/// stays reported as done either way – it is durable in the log.
+unsafe extern "C" fn x_wal_hook(
+    store: *mut c_void,
+    db: *mut ffi::sqlite3,
+    name: *const c_char,
+    _frames: c_int,
+) -> c_int {
+    let store = unsafe { &*(store as *const Mutex<Store>) };
+    let due = store.lock().is_ok_and(|mut store| {
+        let due = store.log_due();
+        if due {
+            store.begin_turnover();
+        }
+        due
+    });
+    if due {
+        let (mut log, mut copied) = (0, 0);
+        unsafe { ffi::sqlite3_wal_checkpoint_v2(db, name, ffi::SQLITE_CHECKPOINT_TRUNCATE, &mut log, &mut copied) };
+        // A failure stops the space's writes; the next one reports it.
+        if let Ok(mut store) = store.lock() {
+            let _ = store.finish_turnover();
+        }
+    }
+    ffi::SQLITE_OK
+}
+
+/// Refuses the app's SQL what would break Temple's tables, `temple_…` in the main database:
+/// writing their rows; creating, dropping or altering them; triggers on them. Deleting rows
+/// stays the app's – an object's row may go in one transaction with the app's own.
+pub(crate) fn guard_tables(db: &Connection, store: &Arc<Mutex<Store>>) {
+    // The space holds `store` for as long as `db` is open.
+    unsafe { ffi::sqlite3_set_authorizer(db.handle(), Some(x_authorize), Arc::as_ptr(store) as *mut c_void) };
+}
+
+unsafe extern "C" fn x_authorize(
+    store: *mut c_void,
+    action: c_int,
+    first: *const c_char,
+    second: *const c_char,
+    schema: *const c_char,
+    _trigger: *const c_char,
+) -> c_int {
+    let (table, any_schema) = match action {
+        ffi::SQLITE_INSERT
+        | ffi::SQLITE_UPDATE
+        | ffi::SQLITE_CREATE_TABLE
+        | ffi::SQLITE_DROP_TABLE
+        | ffi::SQLITE_CREATE_VTABLE
+        | ffi::SQLITE_DROP_VTABLE => (first, false),
+        ffi::SQLITE_ALTER_TABLE => (second, false),
+        // A temporary trigger, too, would run along with Temple's own statements.
+        ffi::SQLITE_CREATE_TRIGGER | ffi::SQLITE_CREATE_TEMP_TRIGGER => (second, true),
+        _ => return ffi::SQLITE_OK,
+    };
+    let name = |text: *const c_char| (!text.is_null()).then(|| unsafe { CStr::from_ptr(text) }.to_bytes());
+    let main = any_schema || name(schema).is_none_or(|schema| schema == b"main");
+    let temple =
+        name(table).and_then(|table| table.get(..7)).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"temple_"));
+    let admin = || unsafe { &*(store as *const Mutex<Store>) }.lock().is_ok_and(|store| store.admin);
+    if main && temple && !admin() { ffi::SQLITE_DENY } else { ffi::SQLITE_OK }
 }
 
 fn register() -> bool {

@@ -34,12 +34,22 @@ export type VaultHandle = VaultState & {
   unlockWithKey(key: Uint8Array): Promise<boolean>;
   /** A new space for words that open none, which opens – once the user confirmed them. */
   createSpace(words: number[], options?: { room?: number }): Promise<void>;
-  /** Locks the open space. */
+  /** Locks the open space, and any space a running call still opens; the state shows it locked even when locking failed. */
   lock(): Promise<void>;
 };
 
-/** What one mount of `useVault` holds. Once done, whatever arrives late is let go at once. */
-type Session = { state: VaultState; done: boolean; show(next: VaultState): void };
+/**
+ * What one mount of `useVault` holds. `locks` counts lock requests: a space a call opens after
+ * one locks at once. Once done, whatever arrives late is let go, and the path is released only
+ * when the mount's running calls have settled.
+ */
+type Session = {
+  state: VaultState;
+  done: boolean;
+  locks: number;
+  running: Set<Promise<unknown>>;
+  show(next: VaultState): void;
+};
 
 // Per path, when its last user will have let go: on the web a file opens once at a time,
 // and StrictMode mounts every effect twice.
@@ -47,12 +57,13 @@ const releases = new Map<string, Promise<void>>();
 
 /**
  * The vault at `path` and its open space, if any: a vault opens one space at a time. The
- * space locks and the vault closes when the component unmounts or `path` changes.
+ * space locks and the vault closes when the component unmounts or `path` changes – and a
+ * space that opens after `lock` was called locks at once.
  */
 export function useVault(path: string): VaultHandle {
   const temple = useTemple();
   const [state, setState] = useState<VaultState>({ status: 'opening' });
-  const session = useRef<Session>({ state, done: false, show: setState });
+  const session = useRef<Session>({ state, done: false, locks: 0, running: new Set(), show: setState });
 
   useEffect(() => {
     let release!: () => void;
@@ -63,6 +74,8 @@ export function useVault(path: string): VaultHandle {
     const current: Session = {
       state: { status: 'opening' },
       done: false,
+      locks: 0,
+      running: new Set(),
       show(next) {
         if (current.done) {
           void letGo(next);
@@ -83,61 +96,103 @@ export function useVault(path: string): VaultHandle {
       );
     return () => {
       current.done = true;
-      void opened.then(() => letGo(current.state)).finally(() => {
-        if (releases.get(path) === released) releases.delete(path);
-        release();
-      });
+      void Promise.allSettled([opened, ...current.running])
+        .then(() => letGo(current.state))
+        .finally(() => {
+          if (releases.get(path) === released) releases.delete(path);
+          release();
+        });
     };
   }, [temple, path]);
 
+  /** Runs one of this mount's calls, so that its end can wait for it. */
+  const run = <T>(call: (mount: Session) => Promise<T>): Promise<T> => {
+    const mount = session.current;
+    const running = call(mount);
+    mount.running.add(running);
+    void running.finally(() => mount.running.delete(running)).catch(() => {});
+    return running;
+  };
   const vault = () => {
     const state = session.current.state;
     if (state.status === 'locked' || state.status === 'open') return state.vault;
     throw new TempleError('NotFound', `no vault is open at ${path}`);
   };
   const create = useCallback(
-    async (words: number[], options?: { room?: number }) => {
-      const mount = session.current;
-      const { vault, space } = await temple.createVault(path, words, options);
-      mount.show({ status: 'open', vault, space });
-    },
+    (words: number[], options?: { room?: number }) =>
+      run(async (mount) => {
+        const locks = mount.locks;
+        const { vault, space } = await temple.createVault(path, words, options);
+        await show(mount, locks, vault, space);
+      }),
     [temple, path],
   );
-  const unlock = useCallback(async (words: number[]) => {
-    const mount = session.current;
-    const opened = vault();
-    const space = await opened.unlock(words);
-    if (space) mount.show({ status: 'open', vault: opened, space });
-    return space !== null;
-  }, []);
-  const unlockWithKey = useCallback(async (key: Uint8Array) => {
-    const mount = session.current;
-    const opened = vault();
-    const space = await opened.unlockWithKey(key);
-    if (space) mount.show({ status: 'open', vault: opened, space });
-    return space !== null;
-  }, []);
-  const createSpace = useCallback(async (words: number[], options?: { room?: number }) => {
-    const mount = session.current;
-    const opened = vault();
-    const space = await opened.createSpace(words, options);
-    mount.show({ status: 'open', vault: opened, space });
-  }, []);
-  const lock = useCallback(async () => {
-    const mount = session.current;
-    const state = mount.state;
-    if (state.status !== 'open') return;
-    await state.space.lock();
-    mount.show({ status: 'locked', vault: state.vault });
-  }, []);
+  const unlock = useCallback(
+    (words: number[]) =>
+      run(async (mount) => {
+        const [locks, opened] = [mount.locks, vault()];
+        const space = await opened.unlock(words);
+        if (space) await show(mount, locks, opened, space);
+        return space !== null;
+      }),
+    [],
+  );
+  const unlockWithKey = useCallback(
+    (key: Uint8Array) =>
+      run(async (mount) => {
+        const [locks, opened] = [mount.locks, vault()];
+        const space = await opened.unlockWithKey(key);
+        if (space) await show(mount, locks, opened, space);
+        return space !== null;
+      }),
+    [],
+  );
+  const createSpace = useCallback(
+    (words: number[], options?: { room?: number }) =>
+      run(async (mount) => {
+        const [locks, opened] = [mount.locks, vault()];
+        await show(mount, locks, opened, await opened.createSpace(words, options));
+      }),
+    [],
+  );
+  const lock = useCallback(
+    () =>
+      run(async (mount) => {
+        mount.locks++;
+        const state = mount.state;
+        if (state.status !== 'open') return;
+        try {
+          await state.space.lock();
+        } finally {
+          // Closed even when locking failed, as when another device took over.
+          mount.show({ status: 'locked', vault: state.vault });
+        }
+      }),
+    [],
+  );
 
   return { ...state, create, unlock, unlockWithKey, createSpace, lock };
 }
 
-/** Locks what a state holds open and closes its vault. */
+/** A space a call opened: shown – or, if a lock was asked for meanwhile, locked at once. */
+async function show(mount: Session, locks: number, vault: Vault, space: Space) {
+  if (mount.locks === locks) {
+    mount.show({ status: 'open', vault, space });
+    return;
+  }
+  await space.lock().catch(() => {});
+  mount.show({ status: 'locked', vault });
+}
+
+const closed = new WeakSet<Vault>();
+
+/** Locks what a state holds open and closes its vault, once. */
 async function letGo(state: VaultState) {
   if (state.status === 'open') await state.space.lock().catch(() => {});
-  if (state.status === 'open' || state.status === 'locked') state.vault.close();
+  if ((state.status === 'open' || state.status === 'locked') && !closed.has(state.vault)) {
+    closed.add(state.vault);
+    state.vault.close();
+  }
 }
 
 const listeners = new WeakMap<Space, Set<() => void>>();
@@ -165,7 +220,7 @@ export type QueryState<T> = { rows: T[]; error: unknown; loading: boolean };
 /** The rows of a query on `space`, run again whenever `changed(space)`. */
 export function useQuery<T extends Row = Row>(space: Space | null, sql: string, params: SqlValue[] = []): QueryState<T> {
   const [state, setState] = useState<QueryState<T>>({ rows: [], error: null, loading: space !== null });
-  const key = params.map(paramKey).join('\u0000');
+  const key = JSON.stringify(params.map(paramKey));
   useEffect(() => {
     if (!space) {
       setState({ rows: [], error: null, loading: false });
@@ -192,7 +247,8 @@ export function useQuery<T extends Row = Row>(space: Space | null, sql: string, 
   return state;
 }
 
-function paramKey(value: SqlValue): string {
-  if (value instanceof Uint8Array) return `b:${Array.from(value).join(',')}`;
-  return `${typeof value}:${String(value)}`;
+/** A parameter as part of the query's key: its type and value, which no other parameter list shares. */
+function paramKey(value: SqlValue): [string, string | number[] | null] {
+  if (value instanceof Uint8Array) return ['blob', Array.from(value)];
+  return [typeof value, value === null ? null : String(value)];
 }

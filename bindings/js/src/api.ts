@@ -24,15 +24,15 @@ export type ErrorKind =
   /** The words already open a space in this vault. */
   | 'WordsInUse'
   | 'NoSuchObject'
-  /** Objects are written outside transactions. */
-  | 'InTransaction'
   /** The space has locked; its words open it again. */
   | 'Locked'
   | 'NotFound'
   | 'AlreadyExists'
   | 'StorageFull'
-  /** On the web: another tab or worker has the vault open. */
+  /** Another tab, worker or process has the vault open. */
   | 'InUse'
+  /** A number that isn't a whole one, or not in range – caught before it reaches Temple. */
+  | 'InvalidArgument'
   | 'Database'
   | 'Io';
 
@@ -81,7 +81,7 @@ export interface Space {
   /** Runs statements separated by semicolons, without parameters. */
   executeBatch(sql: string): Promise<void>;
   query<T extends Row = Row>(sql: string, params?: SqlValue[]): Promise<T[]>;
-  /** Stores bytes as a new object – audio, a document – outside any transaction; returns its id. */
+  /** Stores bytes as a new object – audio, a document – and returns its id; inside a transaction, it commits or rolls back with it. */
   putObject(content: Uint8Array): Promise<number>;
   /** An object's bytes from `start` to `end`, or to its end. */
   readObject(id: number, start?: number, end?: number): Promise<Uint8Array>;
@@ -90,8 +90,10 @@ export interface Space {
   /** 32 bytes for quick unlock, for the app to seal with the device's secure hardware. */
   phraseKey(): Promise<Uint8Array>;
   changedElsewhere(): Promise<boolean>;
-  /** New words for this space; a kept phrase key stops working. */
+  /** New words for this space; a kept phrase key stops working. Interrupted, both words open the space until the change is made again from the old ones. */
   changeWords(words: number[]): Promise<void>;
+  /** Words that open this space no more – the old ones after an interrupted change; whether they did. */
+  forgetWords(words: number[]): Promise<boolean>;
   /** Removes every other space of the vault at once. */
   keepOnlyThis(): Promise<void>;
   /** A new vault holding a copy of this space under the same words: rebuilding a vault. */

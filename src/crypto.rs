@@ -9,18 +9,25 @@ use zeroize::Zeroize;
 pub(crate) const NONCE: usize = 24;
 pub(crate) const TAG: usize = 16;
 
-/// A 256-bit key, wiped from memory when dropped.
-pub(crate) struct Key([u8; 32]);
+/// A 256-bit key, wiped from memory when dropped. Its bytes stay in one place on the heap:
+/// moving a key moves a pointer, and leaves no copy behind.
+pub(crate) struct Key(Box<[u8; 32]>);
 
 impl Key {
+    fn zeros() -> Key {
+        Key(Box::new([0; 32]))
+    }
+
     pub(crate) fn random() -> Key {
-        let mut key = Key([0; 32]);
-        random(&mut key.0);
+        let mut key = Key::zeros();
+        random(&mut key.0[..]);
         key
     }
 
     pub(crate) fn from_bytes(bytes: &[u8; 32]) -> Key {
-        Key(*bytes)
+        let mut key = Key::zeros();
+        key.0.copy_from_slice(bytes);
+        key
     }
 
     pub(crate) fn as_bytes(&self) -> &[u8; 32] {
@@ -28,23 +35,24 @@ impl Key {
     }
 
     pub(crate) fn duplicate(&self) -> Key {
-        Key(self.0)
+        Key::from_bytes(&self.0)
     }
 
     /// HKDF-SHA256 without salt, from this key to `out`.
     pub(crate) fn expand(&self, info: &[u8], out: &mut [u8]) {
-        Hkdf::<Sha256>::new(None, &self.0).expand(info, out).expect("HKDF-SHA256 gives up to 8160 bytes");
+        Hkdf::<Sha256>::new(None, &self.0[..]).expand(info, out).expect("HKDF-SHA256 gives up to 8160 bytes");
     }
 
     /// A subkey: 32 bytes of [`Key::expand`].
     pub(crate) fn derive(&self, info: &[u8]) -> Key {
-        let mut key = Key([0; 32]);
-        self.expand(info, &mut key.0);
+        let mut key = Key::zeros();
+        self.expand(info, &mut key.0[..]);
         key
     }
 
+    /// From the bytes where they are, without a copy on the stack; the cipher wipes its own.
     fn cipher(&self) -> XChaCha20Poly1305 {
-        XChaCha20Poly1305::new(&self.0.into())
+        XChaCha20Poly1305::new_from_slice(&self.0[..]).expect("32 bytes")
     }
 }
 

@@ -7,9 +7,10 @@ A **vault** is one file. A **space** is what one set of 12 words opens; other wo
 ## Opening and locking
 
 - **Words count by index,** not by spelling, so every phrase works with every wordlist. A checksum catches most typos without revealing anything about existing spaces.
-- **Unknown words** with a valid checksum mean a new space. Nothing is written before the app confirms with the user, so a typo leaves no trace.
-- **One space is open at a time.** Locking wipes its keys and everything Temple decrypted from memory.
-- **Quick unlock:** Temple hands out the phrase key for the app to seal with secure hardware, and opens the space with it instead of the words ([format.md](format.md#key-blocks)).
+- **Unknown words** with a valid checksum mean a new space. Nothing is written before the app confirms with the user, so a typo leaves no trace – and the new space gets fresh words, never the ones typed: 1 typo in 16 passes the checksum.
+- **One space is open at a time.** Locking wipes its keys and what Temple decrypted from memory – Temple's own copies; what it hands the app, and the copies bindings make on the way, are the app's ([limits](#limits)).
+- **Quick unlock:** Temple hands out the phrase key for the app to seal with secure hardware, and opens the space with it instead of the words ([format.md](format.md#key-blocks)). It opens that space for whoever passes the device's check, so it belongs to the everyday space only.
+- **New words** move the space to other slots and overwrite the old ones; interrupted, both open it until the change is repeated or the old words are forgotten from inside. The master key stays: whoever has the old words and a copy of the vault from before can still read the space. After words leaked, [rebuild the vault](#rebuilding-a-vault) – a copy gets a fresh master key.
 
 ## Growing without giving away behavior
 
@@ -54,8 +55,8 @@ Destroying helps only before someone copies the vault – afterwards the copy ke
 - **One file,** like a KeePassXC database. Where it lives is the app's choice.
 - **New device:** copy the vault over, then enter the words.
 - **Sync** suits everyday spaces and gives backups for free. Cloud services keep old versions, and comparing them shows where a vault changed, so hidden spaces belong in a vault that doesn't sync. Many phone cloud apps upload the whole vault after a change – fine on Wi-Fi, heavy on mobile data.
-- **One device at a time:** the opening marker in zone 1 tells Temple when another device has opened the vault; it then stops writing ([format.md](format.md#file)).
-- **Copies taken mid-write** open to a state the space had during a session, and to the newest state while a space locks ([storage spike](storage-spike.md), [Temple's tests](../README.md#what-the-tests-show)) – with one exception under [limits](#limits).
+- **One device at a time:** the opening marker in zone 1 tells Temple when another device has opened a space of the vault; it then stops writing ([format.md](format.md#file)). On iOS and Android the vault's file is locked while open, so a second process – an app's extension – is refused.
+- **Copies taken mid-write** open to a state the space had during a session, and to the newest state while a space locks or its log turns over ([storage spike](storage-spike.md), [Temple's tests](../README.md#what-the-tests-show)) – with one exception under [limits](#limits).
 - **Outside the app,** other apps and cloud providers see a vault as random data; its name and place are the user's choice.
 
 ## What a vault reveals
@@ -91,10 +92,11 @@ A fresh vault, filled one opened space at a time: the everyday space first, then
 - **Large hidden spaces:** hiding costs storage. Keeping the LR at 2 for a hidden space of h MB takes noise averaging 1.4 h in every vault, and 1 vault in 10 then carries over 3 h. A full audio Bible (about 1 GB) can't be hidden at a bearable cost.
 - **Destroyed spaces** keep their footprint: "keep only this space" removes the content, not the room it took.
 - **File times** show when the app last used a vault – the opening marker is rewritten at every opening and every lock – but not which space wrote. The phone's own app-usage logs are the app's problem.
-- **Deleted values while a space is open** stay readable in its log until the space locks.
+- **Deleted values while a space is open** stay readable in its log until the log turns over – after 4 MiB of commits at most – or the space locks. A lock that fails, as when another device took over, keeps the log and its key for the next opening to replay.
 - **Full-text search** forgets deleted text only with FTS5, whose `secure-delete` option Temple turns on as a space locks; FTS3 and FTS4 keep deleted terms in their index.
-- **Copies in random order while a space locks:** a copy that holds both superblock copies as the lock rewrote them, but a database page from before the checkpoint wrote it, doesn't open – the log's key is gone from both copies, and the checkpoint's record shows the page missing. 5 of 200 such copies in Temple's test; read front to back, every copy opens.
-- **Copies across commits and a lock:** read in random order, a copy can hold an early superblock and log with pages the lock's checkpoint wrote later. It opens, but the pages that don't match the tag table fail when read – 22 of 2,000 such copies in Temple's longest test. Never does a copy open to a state the space never had.
-- **A space's database** holds at most 1 GiB; large content – audio, documents – belongs in objects.
+- **Copies in random order while a space locks:** a copy that holds both superblock copies as the lock rewrote them, but a database page from before the checkpoint wrote it, doesn't open – the log's key is gone from both copies, and the checkpoint's record shows the page missing. 5 of 200 such copies in Temple's test; read front to back, every copy opens. Copies taken while the log turns over behave alike.
+- **Copies across commits and a lock** – or a turnover of the log: read in random order, a copy can hold an early superblock and log with pages the checkpoint wrote later. It opens, but the pages that don't match the tag table fail when read – 5 of 1,000 such copies in Temple's longest test. Across more than one turnover, the old log's blocks may hold a newer log, and most such copies don't open – 500 of 1,000 there, with the log turning over every few commits rather than every 4 MiB. Never does a copy open to a state the space never had.
+- **A space's database** holds at most 1 GiB; large content – audio, documents – belongs in objects. Its temporary data – sorting, VACUUM – stays in memory: as much RAM as the database takes.
 - **On the web**, a vault is a file of the origin private file system and Temple runs in a worker. Keys and everything decrypted sit in wasm memory, which any script of the page can read – a cross-site script or an extension reads an open space. A vault opens in one tab at a time. Browsers may evict an origin's files unless it asked to persist them, the reserve of up to 2 GB counts against its quota, and how durable a flush is depends on the browser.
-- **Rolled-back blocks:** whoever can write to a vault can put back an older version of a block. Database pages are caught by the tag table; a block of an object passes its check. That tampers with content but reveals nothing; catching it for objects too would take a hash tree, which v1 leaves out.
+- **Rolled-back blocks:** whoever can write to a vault can put back an older version of a block. Database pages are caught by the tag table; a block of an object passes its check. That tampers with content but reveals nothing; catching it for objects too would take a hash tree, which v1 leaves out. A whole older copy put back – blocks and superblocks alike – can't be told from the current one.
+- **What leaves Temple:** query results, objects read, the phrase key and words cross into the app – on React Native and the web through the bindings' buffers and the JavaScript heap, which nothing wipes.

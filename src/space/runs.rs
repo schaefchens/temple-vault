@@ -111,6 +111,7 @@ impl Free {
         Some(free)
     }
 
+    #[cfg(test)]
     pub(crate) fn total(&self) -> u64 {
         self.total
     }
@@ -119,28 +120,76 @@ impl Free {
         if run.len == 0 {
             return;
         }
+        let before = self.runs.range(..run.start).next_back().map(|(&start, &len)| Run { start, len });
+        let after = self.runs.range(run.start..).next().map(|(&start, _)| u64::from(start));
+        // Blocks freed twice would be handed out twice, and one file would overwrite another.
+        assert!(
+            before.is_none_or(|before| before.end() <= u64::from(run.start))
+                && after.is_none_or(|after| after >= run.end()),
+            "blocks freed twice"
+        );
         let (mut start, mut len) = (run.start, run.len);
-        if let Some((&before, &before_len)) = self.runs.range(..start).next_back() {
-            debug_assert!(u64::from(before) + u64::from(before_len) <= u64::from(start), "blocks freed twice");
-            if u64::from(before) + u64::from(before_len) == u64::from(start) {
-                self.runs.remove(&before);
-                start = before;
-                len += before_len;
-            }
-        }
-        if let Ok(after) = u32::try_from(run.end())
-            && let Some(after_len) = self.runs.remove(&after)
+        if let Some(before) = before
+            && before.end() == u64::from(start)
         {
-            len += after_len;
+            self.runs.remove(&before.start);
+            start = before.start;
+            len += before.len;
+        }
+        if after == Some(run.end()) {
+            len += self.runs.remove(&(run.end() as u32)).expect("the run after");
         }
         self.runs.insert(start, len);
         self.total += u64::from(run.len);
     }
 
-    /// Takes `n` blocks, at most [`Free::total`]: from the first run long enough, or else
-    /// from the longest runs.
-    pub(crate) fn take(&mut self, n: u32) -> Vec<Run> {
-        assert!(u64::from(n) <= self.total, "taking more blocks than are free");
+    /// Takes the free blocks among `run` out of use; the others stay as they are.
+    pub(crate) fn remove(&mut self, run: Run) {
+        let (start, end) = (u64::from(run.start), run.end());
+        let before = self.runs.range(..run.start).next_back().map(|(&start, &len)| Run { start, len });
+        let within: Vec<Run> = self
+            .runs
+            .range(run.start..)
+            .take_while(|&(&free, _)| u64::from(free) < end)
+            .map(|(&start, &len)| Run { start, len })
+            .collect();
+        for free in before.into_iter().chain(within).filter(|free| free.end() > start && u64::from(free.start) < end) {
+            self.runs.remove(&free.start);
+            self.total -= u64::from(free.len);
+            if u64::from(free.start) < start {
+                self.insert(free.start, start);
+            }
+            if free.end() > end {
+                self.insert(end as u32, free.end());
+            }
+        }
+    }
+
+    fn insert(&mut self, start: u32, end: u64) {
+        let len = (end - u64::from(start)) as u32;
+        self.runs.insert(start, len);
+        self.total += u64::from(len);
+    }
+
+    /// Free blocks in runs of at least `piece` blocks.
+    pub(crate) fn in_runs_of(&self, piece: u32) -> u64 {
+        if piece <= 1 {
+            return self.total;
+        }
+        self.runs.values().filter(|&&len| len >= piece).map(|&len| u64::from(len)).sum()
+    }
+
+    /// The most blocks [`Free::take`] can give in pieces of at least `piece`: the longest run,
+    /// or all runs that long together.
+    pub(crate) fn room(&self, piece: u32) -> u64 {
+        let longest = self.runs.values().max().map_or(0, |&len| u64::from(len));
+        longest.max(self.in_runs_of(piece))
+    }
+
+    /// Takes `n` blocks, at most [`Free::room`]: from the first run long enough, or else from
+    /// the runs of at least `piece` blocks, the longest first.
+    pub(crate) fn take(&mut self, n: u32, piece: u32) -> Vec<Run> {
+        assert!(u64::from(n) <= self.room(piece), "taking more blocks than are free");
         let mut taken = Vec::new();
         if n == 0 {
             return taken;
@@ -149,7 +198,8 @@ impl Free {
         let starts = match first_fit {
             Some(start) => vec![start],
             None => {
-                let mut longest: Vec<(u32, u32)> = self.runs.iter().map(|(&start, &len)| (start, len)).collect();
+                let mut longest: Vec<(u32, u32)> =
+                    self.runs.iter().filter(|&(_, &len)| len >= piece).map(|(&start, &len)| (start, len)).collect();
                 longest.sort_by_key(|&(start, len)| (Reverse(len), start));
                 longest.into_iter().map(|(start, _)| start).collect()
             }
@@ -191,8 +241,8 @@ mod tests {
         free.add(run(15, 5));
         assert_eq!(free.runs.len(), 1);
         assert_eq!(free.total(), 15);
-        assert_eq!(free.take(4), vec![run(10, 4)]);
-        assert_eq!(free.take(11), vec![run(14, 11)]);
+        assert_eq!(free.take(4, 1), vec![run(10, 4)]);
+        assert_eq!(free.take(11, 1), vec![run(14, 11)]);
         assert_eq!(free.total(), 0);
     }
 
@@ -202,8 +252,48 @@ mod tests {
         free.add(run(0, 2));
         free.add(run(10, 5));
         free.add(run(20, 3));
-        assert_eq!(free.take(7), vec![run(10, 5), run(20, 2)]);
+        assert_eq!(free.take(7, 1), vec![run(10, 5), run(20, 2)]);
         assert_eq!(free.total(), 3);
+    }
+
+    /// Files the superblock records take room in runs of a minimum length, so that scattered
+    /// free blocks can't make their records long.
+    #[test]
+    fn pieces_shorter_than_asked_are_left() {
+        let mut free = Free::default();
+        for start in (0..40).step_by(4) {
+            free.add(run(start, 2));
+        }
+        free.add(run(100, 8));
+        free.add(run(200, 6));
+        assert_eq!((free.total(), free.in_runs_of(6), free.room(6)), (34, 14, 14));
+        assert_eq!(free.room(9), 8);
+        // One run long enough wins; else only runs of 6 or more.
+        assert_eq!(free.take(5, 6), vec![run(100, 5)]);
+        assert_eq!(free.room(6), 6);
+        assert_eq!(free.take(6, 6), vec![run(200, 6)]);
+        assert_eq!(free.room(6), 3);
+    }
+
+    #[test]
+    fn removed_blocks_leave_the_rest_free() {
+        let mut free = Free::complement(0, 100, vec![run(40, 10)]).unwrap();
+        // Across a run's end and the next one's start, inside a run, and outside any.
+        free.remove(run(35, 20));
+        free.remove(run(60, 5));
+        free.remove(run(200, 5));
+        let runs: Vec<Run> = free.runs.iter().map(|(&s, &l)| run(s, l)).collect();
+        assert_eq!(runs, vec![run(0, 35), run(55, 5), run(65, 35)]);
+        assert_eq!(free.total(), 75);
+    }
+
+    #[test]
+    #[should_panic(expected = "blocks freed twice")]
+    fn blocks_freed_twice_are_refused() {
+        let mut free = Free::default();
+        free.add(run(12, 3));
+        // Not caught before: a free run starting inside the one added.
+        free.add(run(10, 5));
     }
 
     #[test]

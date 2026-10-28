@@ -12,6 +12,7 @@ crate-type = ["lib", "cdylib"]
 [dependencies]
 temple-vault = { path = "../.." }
 uniffi = "0.31"
+zeroize = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 futures-channel = "0.3"

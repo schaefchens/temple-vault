@@ -15,6 +15,11 @@
 //! let space = vault.unlock(&words)?.expect("these words open a space");
 //! # Ok::<(), temple_vault::Error>(())
 //! ```
+//!
+//! Temple brings its own SQLite – re-exported as [`rusqlite`] – and must be the first to use
+//! it in a process: it installs a heap that wipes whatever SQLite frees, which SQLite only
+//! takes before it starts, and turns URI filenames off. A space's connection carries Temple's
+//! authorizer and log hook; setting others takes Temple's guards away.
 
 mod crypto;
 mod device;

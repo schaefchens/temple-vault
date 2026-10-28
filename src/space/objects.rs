@@ -32,28 +32,32 @@ pub(super) struct Object {
 
 impl Space {
     /// Stores `content` as a new object and returns its id. Its blocks are written and
-    /// synced before the row that points at them commits.
+    /// synced before the row that points at them commits – with a transaction the app has
+    /// open, so that the app's own rows for the object commit with it. Rolled back, the
+    /// object is gone, and its blocks are free from the next opening.
     pub fn put_object(&self, mut content: impl Read) -> Result<ObjectId, Error> {
-        if !self.db().is_autocommit() {
-            return Err(Error::InTransaction);
-        }
         let key = Key::random();
         let mut used = Vec::new();
         let mut spare = Vec::new();
         let written = self.write_object(&mut content, &key, &mut used, &mut spare);
         self.store.lock().unwrap().give_back(&spare);
-        let stored = written.and_then(|size| {
-            self.store.lock().unwrap().sync()?;
-            self.sql(self.db().execute(
+        let size = match written.and_then(|size| self.store.lock().unwrap().sync().map(|()| size)) {
+            Ok(size) => size,
+            Err(e) => {
+                // Nothing points at them yet.
+                self.store.lock().unwrap().give_back(&used);
+                return Err(e);
+            }
+        };
+        // A commit that fails may still come back from the log after a crash, so its blocks
+        // stay out of use until the next opening, which works out the free ones anew.
+        self.as_temple(|db| {
+            db.execute(
                 "INSERT INTO temple_objects (key, size, blocks) VALUES (?1, ?2, ?3)",
                 params![&key.as_bytes()[..], size as i64, runs::encode(&used)],
-            ))?;
-            Ok(self.db().last_insert_rowid())
-        });
-        if stored.is_err() {
-            self.store.lock().unwrap().give_back(&used);
-        }
-        stored
+            )
+        })?;
+        Ok(self.db().last_insert_rowid())
     }
 
     /// Writes `content` in blocks, allocated in chunks that grow with the object so that a
@@ -76,7 +80,7 @@ impl Space {
             let mut store = self.store.lock().unwrap();
             if spare.is_empty() {
                 let chunk = (runs::count(used) / 2).clamp(256, 65536) as u32;
-                *spare = store.allocate(1, chunk)?;
+                *spare = store.allocate(1, chunk, 1)?;
             }
             let number = spare[0].start;
             spare[0] = Run { start: number + 1, len: spare[0].len - 1 };
@@ -152,13 +156,18 @@ impl Space {
     }
 }
 
-/// The blocks of every object, for working out the free ones.
+/// The blocks of every object, for working out the free ones. A row Temple didn't write
+/// claims none; reading its object fails.
 pub(crate) fn all_runs(db: &Connection) -> Result<Vec<Run>, Error> {
     let mut statement = db.prepare("SELECT blocks FROM temple_objects")?;
     let mut rows = statement.query([])?;
     let mut all = Vec::new();
     while let Some(row) = rows.next()? {
-        all.extend(runs::decode(&row.get::<_, Vec<u8>>(0)?).ok_or(Error::Damaged)?);
+        if let Ok(blocks) = row.get::<_, Vec<u8>>(0)
+            && let Some(runs) = runs::decode(&blocks)
+        {
+            all.extend(runs);
+        }
     }
     Ok(all)
 }

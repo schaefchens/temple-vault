@@ -1,6 +1,6 @@
 //! How long deriving a phrase key takes on this device – Argon2id over the words, 64 MiB,
 //! 3 passes, 4 lanes – and how long it would take with 32 MiB: the numbers that decide the
-//! format's memory (docs/format.md, "Before v1"). On an Android phone connected over USB:
+//! format's memory (docs/format.md, "From words to keys"). On an Android phone connected over USB:
 //! `tools/argon2_on_android.sh`.
 
 use argon2::{Algorithm, Argon2, Params, Version};

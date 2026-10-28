@@ -100,10 +100,11 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     await expectError(() => space.readObject(id), 'NoSuchObject');
   });
 
-  await check('objects are refused inside a transaction', async () => {
+  await check('objects commit or roll back with the transaction they are put in', async () => {
     await space.execute('BEGIN');
-    await expectError(() => space.putObject(new Uint8Array(10)), 'InTransaction');
+    const dropped = await space.putObject(new Uint8Array(10));
     await space.execute('ROLLBACK');
+    await expectError(() => space.objectLength(dropped), 'NoSuchObject');
   });
 
   await check('a locked space refuses every call', async () => {
@@ -120,10 +121,13 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     assert(notes.length === 1 && notes[0].body === 'written before locking', 'the note is back');
   });
 
-  await check('one space at a time; invalid words and keys are refused', async () => {
+  await check('one space at a time; invalid words, keys and numbers are refused', async () => {
     await expectError(() => vault.unlock(first), 'SpaceOpen');
     await expectError(() => vault.unlock(first.slice(0, 11)), 'InvalidWords');
+    // As 16 bits, these would be other words that open nothing – or the same ones.
+    await expectError(() => vault.unlock([...first.slice(0, 11), first[11] + 65536]), 'InvalidWords');
     await expectError(() => vault.unlockWithKey(new Uint8Array(31)), 'InvalidKey');
+    await expectError(() => space.readObject(1, 0.5), 'InvalidArgument');
   });
 
   await check('quick unlock with the phrase key', async () => {
@@ -154,8 +158,11 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     await space.lock();
     assert((await vault.unlock(first)) === null, 'the old words');
     assert((await vault.unlockWithKey(key)) === null, 'the old key');
+    const old = first;
     first = changed;
     space = await opened(vault.unlock(first));
+    assert(!(await space.forgetWords(old)), 'nothing left of the old words to forget');
+    await expectError(() => space.forgetWords(first), 'WordsInUse');
   });
 
   await check('a vault opened again holds what was written', async () => {
@@ -195,7 +202,7 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     copy = null;
   });
 
-  await check('a vault opened twice: the first stops writing, or on the web the second is refused', async () => {
+  await check('a vault opened twice: refused while open, or the first stops once a space opens in the second', async () => {
     space = await opened(vault.unlock(first));
     let other: Vault;
     try {
@@ -205,9 +212,11 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
       throw error;
     }
     try {
+      const there = await opened(other.unlock(first));
       await expectError(() => space.execute('INSERT INTO note (body) VALUES (?)', ['after']), 'ChangedElsewhere');
       assert(await space.changedElsewhere(), 'the space knows');
       await space.lock().catch(() => {});
+      await there.lock();
     } finally {
       other.close();
     }

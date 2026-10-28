@@ -1,11 +1,15 @@
-# Temple's tests on every push: the Rust suite natively and on wasm32, the bindings crate,
-# and the web demo's Playwright run in Chromium, Firefox and WebKit. The React Native E2E
-# run needs simulators and stays local: tools/e2e_react_native.sh.
+# Temple's tests on every push: the Rust suite natively – optimized, and once as a debug build
+# for its overflow checks – and on wasm32, the bindings crate, formatting, clippy, RustSec's
+# advisories, and the web demo's Playwright run in Chromium, Firefox and WebKit. The React
+# Native E2E run needs simulators and stays local: tools/e2e_react_native.sh.
 name: CI
 
 on:
   push:
   pull_request:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,8 +20,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --release
-      - run: cargo check --manifest-path bindings/ffi/Cargo.toml
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --release --locked --all-targets -- -D warnings
+      - run: cargo test --release --locked
+      - run: cargo check --manifest-path bindings/ffi/Cargo.toml --locked
+
+  rust-debug:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Integer overflow is caught only without --release.
+      - run: cargo test --locked
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
+      # Warns of basic-toml, unmaintained, which UniFFI's templates use while building.
+      - run: cargo audit --file bindings/ffi/Cargo.lock
 
   wasm:
     runs-on: ubuntu-latest

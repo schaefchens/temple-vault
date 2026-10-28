@@ -4,6 +4,7 @@ import { expect, test } from './fixtures';
 // private file system.
 test('the self-test passes', async ({ page }) => {
   await page.goto('/?self-test');
+  await page.getByRole('button', { name: 'Run self-test' }).click();
   const result = page.getByTestId('self-test-result');
   await expect(result).toHaveText(/checks (passed|failed)/, { timeout: 280_000 });
   const failed = await page.locator('.check.error').allTextContents();

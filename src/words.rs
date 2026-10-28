@@ -11,14 +11,15 @@ use zeroize::Zeroize;
 /// Only the indices count, so every phrase works with every wordlist; the lists come
 /// from the app.
 pub struct Words {
-    bits: [u8; 16],
+    /// On the heap, as keys are: moving words leaves no copy behind.
+    bits: Box<[u8; 16]>,
 }
 
 impl Words {
     /// 12 fresh words.
     pub fn generate() -> Words {
-        let mut words = Words { bits: [0; 16] };
-        random(&mut words.bits);
+        let mut words = Words { bits: Box::new([0; 16]) };
+        random(&mut words.bits[..]);
         words
     }
 
@@ -38,7 +39,8 @@ impl Words {
                 }
             }
         }
-        let words = Words { bits: packed[..16].try_into().unwrap() };
+        let mut words = Words { bits: Box::new([0; 16]) };
+        words.bits.copy_from_slice(&packed[..16]);
         let valid = packed[16] >> 4 == checksum(&words.bits);
         packed.zeroize();
         if valid { Ok(words) } else { Err(Error::InvalidWords) }
@@ -47,7 +49,7 @@ impl Words {
     /// The 12 indices, each below 2048.
     pub fn indices(&self) -> [u16; 12] {
         let mut packed = [0u8; 17];
-        packed[..16].copy_from_slice(&self.bits);
+        packed[..16].copy_from_slice(&self.bits[..]);
         packed[16] = checksum(&self.bits) << 4;
         let mut indices = [0u16; 12];
         for (i, index) in indices.iter_mut().enumerate() {
@@ -88,7 +90,7 @@ mod tests {
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     fn from_bits(bits: [u8; 16]) -> Words {
-        Words { bits }
+        Words { bits: Box::new(bits) }
     }
 
     #[test]

@@ -11,7 +11,8 @@
       "supportsTablet": true
     },
     "android": {
-      "package": "de.schaefchens.temple.demo"
+      "package": "de.schaefchens.temple.demo",
+      "allowBackup": false
     },
     "plugins": [
       "expo-secure-store",
