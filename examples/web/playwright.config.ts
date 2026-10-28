@@ -6,7 +6,8 @@ export default defineConfig({
   timeout: 300_000,
   fullyParallel: false,
   workers: 1,
-  reporter: 'list',
+  // In CI, failures are annotations on the run too: its log needs a login.
+  reporter: process.env.CI ? [['list'], ['github']] : 'list',
   use: { baseURL: 'http://localhost:4173' },
   webServer: {
     command: 'npm run build && npm run preview -- --port 4173 --strictPort',

@@ -161,7 +161,7 @@ fn a_vault_open_elsewhere_is_left_alone() {
     let path = dir.path().join("reading");
     let partial = dir.path().join(".reading.temple-part");
     let elsewhere = fs::File::create(&partial).unwrap();
-    elsewhere.lock().unwrap();
+    crate::vault::hold(&elsewhere).unwrap();
     let busy = |result: Result<Vault, Error>| matches!(result, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::ResourceBusy);
     assert!(busy(Vault::create(&path, &phrase(0).0, Setup::default()).map(|(vault, _)| vault)));
     assert!(partial.exists());

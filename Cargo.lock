@@ -681,6 +681,7 @@ dependencies = [
  "getrandom",
  "hkdf",
  "js-sys",
+ "libc",
  "rusqlite",
  "sha2",
  "sqlite-wasm-rs",

@@ -185,14 +185,18 @@ pub(crate) fn already_exists() -> io::Error {
 
 /// An exclusive lock on the vault's file while it is open, so that a second process can't
 /// write beside this one between the opening marker's checks. Where the file system has no
-/// locks, the marker alone tells.
+/// locks, the marker alone tells. `flock` itself: Rust's `File::try_lock` has none on Android.
 #[cfg(unix)]
-fn hold(file: &fs::File) -> Result<(), Error> {
-    match file.try_lock() {
-        Err(fs::TryLockError::WouldBlock) => {
+pub(crate) fn hold(file: &fs::File) -> Result<(), Error> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    match io::Error::last_os_error() {
+        e if e.kind() == io::ErrorKind::WouldBlock => {
             Err(io::Error::new(io::ErrorKind::ResourceBusy, "another process has the vault open").into())
         }
-        Ok(()) | Err(fs::TryLockError::Error(_)) => Ok(()),
+        _ => Ok(()),
     }
 }
 

@@ -50,6 +50,8 @@ function Demo() {
       setActive(state === 'active');
       if (state === 'background') void lock();
     });
+    // A change before the listener came is in the current state.
+    setActive(AppState.currentState === 'active');
     return () => subscription.remove();
   }, [lock]);
 

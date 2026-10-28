@@ -6,7 +6,7 @@ A parallel review of the same day was checked point by point; what held up is in
 
 Severity: **high** – breaks a promise in normal use; **medium** – through a plausible mistake, crash or app bug; **low** – hardening and docs. Line numbers are those of 16bd3e5.
 
-Fixes, the same day: every item has a **Fixed** or **Open** line, the fixed ones a test that failed before. With them, the Rust suite passes in release and debug builds and on wasm32, the soak run passes, clippy and rustfmt are clean, and both demos type-check. Not run: devices, the React Native E2E – its native libraries need `npm run build:ios` and `build:android` first – and fuzzing.
+Fixes, the same day: every item has a **Fixed** or **Open** line, the fixed ones a test that failed before. With them, the Rust suite passes in release and debug builds, on wasm32, on the iOS simulator (iOS 26.3) and on the Android emulator (Android 16, arm64); the soak run passes, clippy and rustfmt are clean, and the demos' flows pass – Maestro on both, Playwright in Chromium, Firefox and WebKit. The emulator caught the file lock missing on Android, where Rust's `File::try_lock` has none; Temple calls `flock` itself now. Not run: fuzzing.
 
 ## What holds up
 
