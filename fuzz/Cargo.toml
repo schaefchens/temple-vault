@@ -1,0 +1,37 @@
+[package]
+name = "temple-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+temple = { path = "..", features = ["fuzzing"] }
+
+# Not part of a workspace with the library.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "slot_table"
+path = "fuzz_targets/slot_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "superblock"
+path = "fuzz_targets/superblock.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "space"
+path = "fuzz_targets/space.rs"
+test = false
+doc = false
+bench = false
