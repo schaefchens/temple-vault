@@ -1,7 +1,7 @@
 # Temple's tests on every push: the Rust suite natively – optimized, and once as a debug build
 # for its overflow checks – and on wasm32, the bindings crate, formatting, clippy, RustSec's
-# advisories, and the web demo's Playwright run in Chromium, Firefox and WebKit. The React
-# Native E2E run needs simulators and stays local: tools/e2e_react_native.sh.
+# advisories, and the web demo's Playwright run – Chromium and Firefox on Linux, WebKit on
+# macOS. The React Native E2E run needs simulators and stays local: tools/e2e_react_native.sh.
 name: CI
 
 on:
@@ -65,10 +65,19 @@ jobs:
       - run: tools/test_on_wasm.sh
 
   web-e2e:
-    runs-on: ubuntu-latest
-    env:
-      CC_wasm32_unknown_unknown: clang
-      AR_wasm32_unknown_unknown: llvm-ar
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            browsers: chromium firefox
+            projects: --project=chromium --project=firefox
+          # Outside Apple's systems WebKit gives an origin 1,000 MB, and counts a reopened
+          # vault again once it grows: vaults stop at about 450 MB (docs/design.md).
+          - os: macos-latest
+            browsers: webkit
+            projects: --project=webkit
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -77,11 +86,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: sudo apt-get install -y clang llvm
+      # LLVM's clang and ar for SQLite's C code; bindings/web/build.sh finds Homebrew's.
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y clang llvm
+          echo CC_wasm32_unknown_unknown=clang >> "$GITHUB_ENV"
+          echo AR_wasm32_unknown_unknown=llvm-ar >> "$GITHUB_ENV"
+      - if: runner.os == 'macOS'
+        run: brew install llvm
       - name: wasm-bindgen-cli at the bindings' Cargo.lock version
         run: cargo install wasm-bindgen-cli --locked --version "$(cargo metadata --manifest-path bindings/ffi/Cargo.toml --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')"
       - run: npm ci
       - run: npm run build -w @schaefchens/temple-web
-      - run: npx playwright install --with-deps chromium firefox webkit
+      - run: npx playwright install --with-deps ${{ matrix.browsers }}
         working-directory: examples/web
-      - run: npm run e2e -w temple-demo-web
+      - run: npm run e2e -w temple-demo-web -- ${{ matrix.projects }}
