@@ -12,6 +12,8 @@ use crate::vault::{Setup, Vault};
 use crate::{BLOCK, Space};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen_test::wasm_bindgen_test as test;
 
 /// A tiny deterministic generator.
 struct Rng(u64);

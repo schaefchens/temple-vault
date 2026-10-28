@@ -1,0 +1,23 @@
+{
+  "name": "@schaefchens/temple-web",
+  "version": "0.0.0",
+  "description": "Temple for the web: vaults in the origin private file system, in a worker",
+  "license": "Apache-2.0",
+  "private": true,
+  "type": "module",
+  "repository": { "type": "git", "url": "https://github.com/schaefchens/temple-vault.git" },
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "build": "sh build.sh"
+  },
+  "dependencies": {
+    "@schaefchens/temple": "*",
+    "@ubjs/core": "0.31.0-6",
+    "@ubjs/wasm": "0.31.0-6"
+  },
+  "devDependencies": {
+    "uniffi-bindgen-react-native": "0.31.0-6"
+  }
+}

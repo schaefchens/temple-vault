@@ -1,0 +1,106 @@
+# The demo as a person uses it: one vault, two spaces, notes, a file, locking.
+appId: de.schaefchens.temple.demo
+---
+- launchApp:
+    clearState: true
+- extendedWaitUntil:
+    visible: Create vault
+    timeout: 30000
+- copyTextFrom:
+    id: words
+- evalScript: ${output.first = maestro.copiedText}
+- tapOn: Create vault
+# The vault writes its reserve of noise first: hundreds of megabytes.
+- extendedWaitUntil:
+    visible: Notes
+    timeout: 180000
+
+# Notes, full-text search, a file.
+- tapOn:
+    id: note-input
+- inputText: Buy milk
+- pressKey: Enter
+- assertVisible: Buy milk
+- tapOn:
+    id: search-input
+- inputText: zebra
+- assertNotVisible: Buy milk
+- eraseText
+- inputText: mil
+- assertVisible: Buy milk
+- eraseText
+- hideKeyboard
+- tapOn: Attach sample file
+- assertVisible: "sample-.*\\.bin · 256 KiB"
+- tapOn: Check
+- assertVisible: ".*: intact"
+
+# Locking; words that open nothing, a typo, the right words.
+- tapOn: Lock
+- assertVisible: Locked
+- tapOn:
+    id: words-input
+- inputText: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+- pressKey: Enter
+- assertVisible: These words open no space.
+- tapOn: Clear
+- tapOn:
+    id: words-input
+- inputText: abandon abandon
+- pressKey: Enter
+- assertVisible: "These aren.t 12 valid words.*"
+- tapOn: Clear
+- tapOn:
+    id: words-input
+- inputText: ${output.first}
+- pressKey: Enter
+- extendedWaitUntil:
+    visible: Buy milk
+    timeout: 30000
+
+# A second space under other words sees nothing of the first, and the other way round.
+- tapOn: Lock
+- tapOn: New space…
+- copyTextFrom:
+    id: words
+- evalScript: ${output.second = maestro.copiedText}
+- tapOn: Create space
+- extendedWaitUntil:
+    visible: Notes
+    timeout: 60000
+- assertNotVisible: Buy milk
+- tapOn:
+    id: note-input
+- inputText: Hidden note
+- pressKey: Enter
+- assertVisible: Hidden note
+- tapOn: Lock
+- tapOn:
+    id: words-input
+- inputText: ${output.first}
+- pressKey: Enter
+- extendedWaitUntil:
+    visible: Buy milk
+    timeout: 30000
+- assertNotVisible: Hidden note
+
+# Leaving the app locks the space.
+- pressKey: Home
+- launchApp:
+    stopApp: false
+- assertVisible: Locked
+
+# After a restart both spaces open again with their words.
+- stopApp
+- launchApp
+- extendedWaitUntil:
+    visible: Locked
+    timeout: 30000
+- tapOn:
+    id: words-input
+- inputText: ${output.second}
+- pressKey: Enter
+- extendedWaitUntil:
+    visible: Hidden note
+    timeout: 30000
+- assertNotVisible: Buy milk

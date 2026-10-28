@@ -9,10 +9,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/.."
 
 cargo ndk -t arm64-v8a -P 26 test --release --no-run
-tests=$(ls -t target/aarch64-linux-android/release/deps/temple-* | grep -v '\.d$' | head -1)
+tests=$(ls -t target/aarch64-linux-android/release/deps/temple_vault-* | grep -v '\.d$' | head -1)
 adb push "$tests" /data/local/tmp/temple-tests >/dev/null
 adb shell "cd /data/local/tmp && TMPDIR=/data/local/tmp ./temple-tests"
 
 cargo test --release --target aarch64-apple-ios-sim --no-run
-tests=$(ls -t target/aarch64-apple-ios-sim/release/deps/temple-* | grep -v '\.d$' | head -1)
+tests=$(ls -t target/aarch64-apple-ios-sim/release/deps/temple_vault-* | grep -v '\.d$' | head -1)
 xcrun simctl spawn booted "$PWD/$tests"

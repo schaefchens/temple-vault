@@ -1,0 +1,61 @@
+# Temple's tests on every push: the Rust suite natively and on wasm32, the bindings crate,
+# and the web demo's Playwright run in Chromium, Firefox and WebKit. The React Native E2E
+# run needs simulators and stays local: tools/e2e_react_native.sh.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release
+      - run: cargo check --manifest-path bindings/ffi/Cargo.toml
+
+  wasm:
+    runs-on: ubuntu-latest
+    env:
+      # SQLite's C code for wasm32 needs LLVM's clang and ar.
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get install -y clang llvm
+      - name: wasm-bindgen-cli at Cargo.lock's version
+        run: cargo install wasm-bindgen-cli --locked --version "$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')"
+      - run: tools/test_on_wasm.sh
+
+  web-e2e:
+    runs-on: ubuntu-latest
+    env:
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: sudo apt-get install -y clang llvm
+      - name: wasm-bindgen-cli at the bindings' Cargo.lock version
+        run: cargo install wasm-bindgen-cli --locked --version "$(cargo metadata --manifest-path bindings/ffi/Cargo.toml --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')"
+      - run: npm ci
+      - run: npm run build -w @schaefchens/temple-web
+      - run: npx playwright install --with-deps chromium firefox webkit
+        working-directory: examples/web
+      - run: npm run e2e -w temple-demo-web

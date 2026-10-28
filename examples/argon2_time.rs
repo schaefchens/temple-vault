@@ -5,7 +5,7 @@
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use std::time::{Duration, Instant};
-use temple::{PhraseKey, Words};
+use temple_vault::{PhraseKey, Words};
 
 fn main() {
     let words = Words::generate();

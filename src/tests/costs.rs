@@ -2,12 +2,13 @@
 //! table.
 
 use super::memory::Memory;
-use super::{create_on, phrase};
+use super::{create_on, now, phrase};
 use crate::crypto::random;
 use crate::keys::PhraseKey;
 use crate::slots::SLOTS;
 use crate::{Setup, ZONE};
-use std::time::{Duration, Instant};
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen_test::wasm_bindgen_test as test;
 
 /// Unlocking reads and opens all four slots whatever they hold, after Argon2 – which takes
 /// a hundred milliseconds and more, where opening a slot takes a microsecond.
@@ -32,14 +33,14 @@ fn unknown_words_cost_the_same_as_known_ones() {
     let mut times = [Vec::new(), Vec::new()];
     for _ in 0..7 {
         for (n, times) in times.iter_mut().enumerate() {
-            let clock = Instant::now();
+            let start = now();
             unlock(n);
-            times.push(clock.elapsed());
+            times.push(now() - start);
         }
     }
-    let median = |times: &mut Vec<Duration>| {
-        times.sort();
-        times[times.len() / 2].as_secs_f64()
+    let median = |times: &mut Vec<f64>| {
+        times.sort_by(f64::total_cmp);
+        times[times.len() / 2]
     };
     let ratio = median(&mut times[0]) / median(&mut times[1]);
     assert!((0.5..2.0).contains(&ratio), "known / unknown = {ratio}");

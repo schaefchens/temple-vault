@@ -10,6 +10,7 @@ use crate::slots::{INNER_VERSION, KeyBlock};
 use crate::vault::{Vault, VaultFile};
 use crate::{BLOCK, Error};
 use rusqlite::Connection;
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
 use zeroize::Zeroizing;
@@ -18,8 +19,18 @@ impl Space {
     /// A new vault at `path` holding a copy of this space under the same words: the first
     /// step of rebuilding a vault, with the everyday space. The reserve follows it, and the
     /// vault is written to a temporary file and renamed into place.
+    #[cfg(unix)]
     pub fn copy_to_new_vault(&self, path: impl AsRef<Path>) -> Result<Vault, Error> {
         Vault::create_at(path.as_ref(), noise::REAL, |file| self.copy_to(file, true)).map(|(vault, ())| vault)
+    }
+
+    /// On the web: [`Space::copy_to_new_vault`] into an empty file of the origin private
+    /// file system, through a sync access handle to it – named as
+    /// [`Vault::create_with_handle`] describes.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub fn copy_to_new_vault_with_handle(&self, handle: web_sys::FileSystemSyncAccessHandle) -> Result<Vault, Error> {
+        let device = Arc::new(crate::device::OpfsDevice::new(handle));
+        Vault::create_on(device, noise::REAL, |file| self.copy_to(file, true)).map(|(vault, ())| vault)
     }
 
     /// Copies this space into another vault under the same words: the next steps of

@@ -65,6 +65,8 @@ impl Noise {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
 
     fn mean(draws: &[u64]) -> f64 {
         draws.iter().sum::<u64>() as f64 / draws.len() as f64

@@ -377,16 +377,33 @@ unsafe extern "C" fn x_randomness(_vfs: *mut ffi::sqlite3_vfs, n: c_int, out: *m
     n
 }
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 unsafe extern "C" fn x_sleep(_vfs: *mut ffi::sqlite3_vfs, micros: c_int) -> c_int {
     std::thread::sleep(std::time::Duration::from_micros(micros as u64));
     micros
 }
 
+/// The web can't sleep, and needn't: with one connection in exclusive mode, SQLite never waits.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+unsafe extern "C" fn x_sleep(_vfs: *mut ffi::sqlite3_vfs, _micros: c_int) -> c_int {
+    0
+}
+
 unsafe extern "C" fn x_current_time(_vfs: *mut ffi::sqlite3_vfs, out: *mut f64) -> c_int {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     // A Julian day number.
-    unsafe { *out = 2440587.5 + now.as_secs_f64() / 86400.0 };
+    unsafe { *out = 2440587.5 + unix_seconds() / 86400.0 };
     ffi::SQLITE_OK
+}
+
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn unix_seconds() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+}
+
+/// The browser's clock: wasm has no system time.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn unix_seconds() -> f64 {
+    js_sys::Date::now() / 1000.0
 }
 
 fn register() -> bool {

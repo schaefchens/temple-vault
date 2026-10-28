@@ -1,0 +1,16 @@
+{
+  "name": "temple-workspace",
+  "private": true,
+  "workspaces": [
+    "bindings/js",
+    "bindings/react",
+    "bindings/react-native",
+    "bindings/web",
+    "examples/react-native",
+    "examples/web"
+  ],
+  "overrides": {
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  }
+}

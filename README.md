@@ -13,17 +13,27 @@ Status: v1 built and tested, October 2026, its format final; its release waits f
 | [docs/storage-spike.md](docs/storage-spike.md) | Storage spike: SQLite against redb – results and decision |
 | [tools/noise_sim.py](tools/noise_sim.py) | Noise simulation behind the format's numbers: `python3 tools/noise_sim.py` |
 | [tools/test_on_devices.sh](tools/test_on_devices.sh) | The tests on an Android emulator or phone and on the iOS simulator |
+| [tools/test_on_wasm.sh](tools/test_on_wasm.sh) | The tests on wasm32, in Node: 32-bit, one thread, the browser's clock and random source |
 | [tools/argon2_on_android.sh](tools/argon2_on_android.sh) | How long the phrase key takes on an Android phone over USB |
 | [spikes/storage](spikes/storage) | The storage spike's code: `cargo run --release` |
+| [bindings/ffi](bindings/ffi) | Temple's API for TypeScript through UniFFI, which uniffi-bindgen-react-native builds for React Native and the web |
+| [bindings/js](bindings/js) | `@schaefchens/temple`: the TypeScript API both platforms share, BIP-39's English wordlist, and the self-test |
+| [bindings/react-native](bindings/react-native) | `@schaefchens/temple-react-native`, for iOS and Android: `npm run build:ios`, `npm run build:android` |
+| [bindings/web](bindings/web) | `@schaefchens/temple-web`: Temple in a worker, vaults in the origin private file system: `npm run build` |
+| [bindings/react](bindings/react) | `@schaefchens/temple-react`: hooks for a vault, its open space and queries, on either platform |
+| [examples/react-native](examples/react-native) | A notes app on Temple for iOS and Android (Expo), with Maestro flows: [tools/e2e_react_native.sh](tools/e2e_react_native.sh) |
+| [examples/web](examples/web) | The same as a PWA (Vite), with Playwright specs for Chromium, Firefox and WebKit |
 
 ## Scope
 
-- **In Temple:** the vault file, words to keys, spaces (create, open, lock, change words, keep only this space, copy into another vault), storage inside a space, the phrase key for quick unlock. A Rust API; Hosana's Rust core binds what the app needs for Swift and Kotlin.
-- **In the app:** screens, wordlists, lock triggers, sealing the phrase key with the phone's secure hardware, its own data schema.
+- **In Temple:** the vault file, words to keys, spaces (create, open, lock, change words, keep only this space, copy into another vault), storage inside a space, the phrase key for quick unlock. A Rust API, and TypeScript bindings for React Native (iOS, Android) and the web, with React hooks.
+- **In the app:** screens, wordlists (BIP-39's English one comes along), lock triggers, sealing the phrase key with the device's secure hardware, its own data schema.
 
 ## What the tests show
 
 - **On phones:** every test passes on the Android emulator (Android 16, arm64) and the iOS simulator (iOS 26.3) as on the Mac. On the emulator slowed to a cheap phone's pace, the phrase key takes 1.1–1.65 s – inside the 2 s that settled Argon2 at 64 MiB ([format.md](docs/format.md#from-words-to-keys)).
+- **On wasm32:** every test but the real-file ones passes in Node (2026-10-28), 32-bit and on one thread.
+- **In apps:** the bindings' self-test – 19 checks, from SQL values, full-text search and objects to second spaces, changed words, rebuilding and a vault opened twice – passes in the React Native demo on the iOS simulator and the Android emulator, and in the PWA in Chromium, Firefox and WebKit (2026-10-28). So do the demos' own flows, with Maestro and Playwright: two spaces that don't see each other, a file in and out, wrong words and a typo, locking when the app or page is left, a restart or reload – and on the web a second tab refused and working offline.
 - **Crashes:** a crash at any write keeps every commit made durable – while a space is used, created, grows, locks, changes words or keeps only itself. A crash keeps what the last sync made durable and any choice of the 4 KiB pieces written since. A long run (`cargo test --release soak -- --ignored`) tries 8,000 crashes and 2,000 copies over 40 workloads.
 - **Copies** taken during a session open to a state the space had. Taken while it locks, they open to the newest state – read front to back always, in random order in 195 of 200 tries; the rest don't open. Taken across commits and a lock, a copy may hold pages from both sides, which then fail when read ([limits](docs/design.md#limits)). Never does a copy open to a state the space didn't have.
 - **Deleted values** can't be read once a space locks, not even with its words – search terms in FTS5 included; no superblock copy keeps the log's key, not even decrypted unchecked.
@@ -38,4 +48,4 @@ Status: v1 built and tested, October 2026, its format final; its release waits f
 
 ## License
 
-Apache License 2.0 – see [LICENSE](LICENSE). The crate name `temple` is taken on crates.io; publishing would need another name.
+Apache License 2.0 – see [LICENSE](LICENSE). On crates.io the crate is `temple-vault`, imported as `temple_vault` – not published yet.

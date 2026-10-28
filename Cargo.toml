@@ -1,5 +1,5 @@
 [package]
-name = "temple"
+name = "temple-vault"
 version = "0.0.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -16,8 +16,19 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 sha2 = "0.10"
 zeroize = "1"
 
-[dev-dependencies]
+# On the web: the browser's random source and clock, and its origin private file system.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+js-sys = "0.3"
+# rusqlite's SQLite there: its clock, sleep and random source come from the browser.
+sqlite-wasm-rs = { version = "0.6", default-features = false, features = ["wasm-bindgen"] }
+web-sys = { version = "0.3", features = ["FileSystemReadWriteOptions", "FileSystemSyncAccessHandle"] }
+
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [features]
 # Entry points for the fuzz targets in fuzz/; not part of the API.

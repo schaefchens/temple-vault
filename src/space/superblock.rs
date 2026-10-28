@@ -249,6 +249,8 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
 
     fn example(checkpoint: Vec<u32>) -> Superblock {
         Superblock {
@@ -316,9 +318,9 @@ mod tests {
             payload
         };
         assert_eq!(Superblock::decode(&with_runs(1)).unwrap().checkpoint.len(), MAX_PAGES as usize);
-        let clock = std::time::Instant::now();
+        let start = crate::tests::now();
         assert!(Superblock::decode(&with_runs(4000)).is_none());
-        assert!(clock.elapsed() < std::time::Duration::from_millis(100));
+        assert!(crate::tests::now() - start < 0.1);
     }
 
     #[test]

@@ -4,6 +4,8 @@ use super::memory::Memory;
 use super::{SMALL_NOISE, create_on, phrase};
 use crate::vault::{Setup, Vault};
 use crate::{Error, Space, ZONE};
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen_test::wasm_bindgen_test as test;
 
 fn notes(space: &Space) -> Vec<String> {
     let mut statement = space.db().prepare("SELECT body FROM note ORDER BY rowid").unwrap();

@@ -1,0 +1,5 @@
+rust:
+  directory: ../ffi
+  manifestPath: Cargo.toml
+wasm2:
+  ts: src/generated

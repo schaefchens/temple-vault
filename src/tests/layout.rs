@@ -5,6 +5,8 @@ use super::phrase;
 use crate::noise::Amounts;
 use crate::vault::{Setup, Vault};
 use crate::{Space, ZONE};
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen_test::wasm_bindgen_test as test;
 
 /// Noise that can be told apart: 7 zones of reserve, 3 after each growth step.
 const COUNTED: Amounts = Amounts { reserve: || 7, growth: || 3 };

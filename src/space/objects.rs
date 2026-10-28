@@ -96,8 +96,11 @@ impl Space {
     pub fn read_object(&self, id: ObjectId, range: Range<u64>) -> Result<Vec<u8>, Error> {
         let object = self.object(id)?;
         let end = range.end.min(object.size);
+        // On 32-bit targets such as wasm, a range can exceed what memory holds.
+        let len = usize::try_from(end.saturating_sub(range.start))
+            .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "the range is larger than memory can hold"))?;
         // Wiped if reading fails halfway.
-        let mut out = Zeroizing::new(Vec::with_capacity(end.saturating_sub(range.start) as usize));
+        let mut out = Zeroizing::new(Vec::with_capacity(len));
         let mut block = Zeroizing::new([0u8; BLOCK]);
         let store = self.store.lock().unwrap();
         let mut at = range.start;

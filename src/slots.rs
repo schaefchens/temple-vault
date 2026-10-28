@@ -70,6 +70,8 @@ pub(crate) fn offset(slot: u16) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
 
     fn block() -> KeyBlock {
         KeyBlock { inner_version: 1, generation: 7, master_key: Key::random(), first_zone: 42 }

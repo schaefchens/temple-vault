@@ -40,6 +40,8 @@ fn quote(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
 
     #[test]
     fn recognizes_fts5_tables() {

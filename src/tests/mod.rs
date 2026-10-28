@@ -4,6 +4,7 @@
 mod copies;
 mod costs;
 mod crash;
+#[cfg(unix)]
 mod files;
 mod layout;
 mod memory;
@@ -83,6 +84,19 @@ pub(crate) fn superblock_bytes(vault: &[u8], master: &Key, first_zone: u64) -> V
         }
     }
     plain
+}
+
+/// Seconds on a clock that only moves forward.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub(crate) fn now() -> f64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
+/// wasm has no `Instant`; the browser's clock in milliseconds is fine enough for tests.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub(crate) fn now() -> f64 {
+    js_sys::Date::now() / 1000.0
 }
 
 pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {

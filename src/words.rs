@@ -84,6 +84,8 @@ impl fmt::Debug for Words {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
 
     fn from_bits(bits: [u8; 16]) -> Words {
         Words { bits }

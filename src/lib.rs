@@ -5,7 +5,7 @@
 //! byte layout: `docs/format.md`.
 //!
 //! ```no_run
-//! use temple::{Setup, Vault, Words};
+//! use temple_vault::{Setup, Vault, Words};
 //!
 //! let words = Words::generate();
 //! let (vault, space) = Vault::create("reading.vault", &words, Setup::default())?;
@@ -13,7 +13,7 @@
 //! space.lock()?;
 //!
 //! let space = vault.unlock(&words)?.expect("these words open a space");
-//! # Ok::<(), temple::Error>(())
+//! # Ok::<(), temple_vault::Error>(())
 //! ```
 
 mod crypto;

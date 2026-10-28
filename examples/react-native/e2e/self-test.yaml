@@ -1,0 +1,22 @@
+# Temple's self-test on the device: the API end to end, two real vaults.
+appId: de.schaefchens.temple.demo
+---
+- launchApp:
+    clearState: true
+# Once the app listens for links: one that comes while it starts is lost.
+- extendedWaitUntil:
+    visible: Create vault
+    timeout: 30000
+- openLink: temple-demo://self-test
+# iOS may ask before an app opens its own link.
+- tapOn:
+    text: Open
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: self-test-result
+      text: "All .* checks passed|.* checks failed"
+    timeout: 300000
+- assertVisible:
+    id: self-test-result
+    text: "All .* checks passed"

@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "Temple Demo",
+    "slug": "temple-demo",
+    "scheme": "temple-demo",
+    "version": "1.0.0",
+    "orientation": "default",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "bundleIdentifier": "de.schaefchens.temple.demo",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "de.schaefchens.temple.demo"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-status-bar"
+    ]
+  }
+}

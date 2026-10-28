@@ -102,6 +102,8 @@ pub(crate) fn open_trailing(key: &Key, ad: &[u8], buf: &mut [u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
 
     #[test]
     fn sealed_data_opens_only_with_its_key_and_place() {

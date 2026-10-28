@@ -6,6 +6,8 @@ use crate::slots::{SLOT, SLOTS};
 use crate::vault::{Setup, Vault};
 use crate::{Error, Space, ZONE};
 use std::sync::Arc;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use wasm_bindgen_test::wasm_bindgen_test as test;
 
 fn new_vault() -> (Arc<Memory>, Vault, Space) {
     let memory = Memory::new();

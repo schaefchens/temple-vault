@@ -1,0 +1,15 @@
+rust:
+  directory: ../ffi
+  manifestPath: Cargo.toml
+android:
+  directory: android
+  packageName: de.schaefchens.temple
+ios:
+  directory: ios
+  targets: [aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios]
+jsi2:
+  ts: src/generated
+  bundleIdPrefix: de.schaefchens
+# The generated entry, which src/temple.ts wraps: the package's own entry stays ours.
+turboModule:
+  entrypoint: src/index.tsx

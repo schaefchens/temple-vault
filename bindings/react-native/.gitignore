@@ -1,0 +1,6 @@
+# Built by ubrn from ../ffi: npm run build:ios, npm run build:android
+src/generated/
+src/index.tsx
+ios/
+android/
+TempleReactNative.podspec

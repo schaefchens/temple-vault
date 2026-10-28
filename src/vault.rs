@@ -2,15 +2,21 @@
 //! from zone 2 on, appended in whole zones.
 
 use crate::crypto::{Key, random};
-use crate::device::{Device, FileDevice};
+use crate::device::Device;
+#[cfg(unix)]
+use crate::device::FileDevice;
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+use crate::device::OpfsDevice;
 use crate::keys::PhraseKey;
 use crate::noise::{self, Noise};
 use crate::slots::{self, KeyBlock, SLOT};
 use crate::space::Space;
 use crate::words::Words;
 use crate::{BLOCK, Error, ZONE};
+#[cfg(unix)]
 use std::fs::{self, OpenOptions};
 use std::io;
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +43,7 @@ impl Vault {
     /// exists at `path`. The vault is written next to it, as `.<name>.part`, and given its name
     /// once complete, so a crash leaves no half-made vault at `path`; the next try removes
     /// what it left.
+    #[cfg(unix)]
     pub fn create(path: impl AsRef<Path>, words: &Words, setup: Setup) -> Result<(Vault, Space), Error> {
         let key = PhraseKey::from_words(words);
         Vault::create_at(path.as_ref(), noise::REAL, |file| Space::create(file, file.claim(), key, setup, true))
@@ -44,6 +51,7 @@ impl Vault {
 
     /// A new vault at `path`, filled by `fill` in `.<name>.part` next to it and given its name
     /// once complete.
+    #[cfg(unix)]
     pub(crate) fn create_at<T>(
         path: &Path,
         noise: noise::Amounts,
@@ -77,6 +85,9 @@ impl Vault {
         noise: noise::Amounts,
         fill: impl FnOnce(&Arc<VaultFile>) -> Result<T, Error>,
     ) -> Result<(Vault, T), Error> {
+        if device.len()? != 0 {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a new vault needs an empty file").into());
+        }
         let file = Arc::new(VaultFile::new(device, noise));
         // The slot table and zone 1: random bytes until spaces claim slots.
         file.append_noise(2)?;
@@ -86,10 +97,33 @@ impl Vault {
     }
 
     /// Opens a vault. Writes nothing but the opening marker until a space opens.
+    #[cfg(unix)]
     pub fn open(path: impl AsRef<Path>) -> Result<Vault, Error> {
         let path = path.as_ref();
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         Vault::open_on(Arc::new(FileDevice::new(file, path)), noise::REAL)
+    }
+
+    /// On the web: a new vault with its first space, which comes back open, in an empty file
+    /// of the origin private file system, through a sync access handle to it. Name the file
+    /// as [`Vault::create`] does – a temporary name, given the vault's own once this returns
+    /// and the handle has closed – so a tab closed halfway leaves no half-made vault.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub fn create_with_handle(
+        handle: web_sys::FileSystemSyncAccessHandle,
+        words: &Words,
+        setup: Setup,
+    ) -> Result<(Vault, Space), Error> {
+        let key = PhraseKey::from_words(words);
+        let device = Arc::new(OpfsDevice::new(handle));
+        Vault::create_on(device, noise::REAL, |file| Space::create(file, file.claim(), key, setup, true))
+    }
+
+    /// On the web: opens a vault through a sync access handle to its file, as [`Vault::open`]
+    /// does. The handle closes once the vault and its spaces are dropped.
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub fn open_with_handle(handle: web_sys::FileSystemSyncAccessHandle) -> Result<Vault, Error> {
+        Vault::open_on(Arc::new(OpfsDevice::new(handle)), noise::REAL)
     }
 
     pub(crate) fn open_on(device: Arc<dyn Device>, noise: noise::Amounts) -> Result<Vault, Error> {
@@ -129,6 +163,7 @@ impl Vault {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn already_exists() -> io::Error {
     io::Error::new(io::ErrorKind::AlreadyExists, "something exists at the vault's path")
 }
