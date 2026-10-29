@@ -1,10 +1,14 @@
 [package]
 name = "temple-vault"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Vaults: one file, any number of spaces, each opened by its own 12 words"
-publish = false
+description = "Encrypted storage with plausible deniability: one file, any number of spaces, each opened by its own 12 words"
+repository = "https://github.com/schaefchens/temple-vault"
+readme = "README.md"
+keywords = ["encryption", "deniability", "sqlite", "vault", "privacy"]
+categories = ["cryptography", "database"]
+include = ["/src", "/examples/argon2_time.rs", "/README.md", "/LICENSE"]
 
 [dependencies]
 argon2 = { version = "0.6", default-features = false, features = ["zeroize"] }

@@ -473,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "temple-vault"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "blake2",

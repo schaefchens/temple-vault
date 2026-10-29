@@ -1,9 +1,22 @@
 {
   "name": "@schaefchens/temple",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Temple's TypeScript API, shared by its React Native and web bindings",
   "license": "Apache-2.0",
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/schaefchens/temple-vault.git",
+    "directory": "bindings/js"
+  },
+  "homepage": "https://github.com/schaefchens/temple-vault#readme",
+  "keywords": [
+    "encryption",
+    "plausible-deniability",
+    "sqlite",
+    "vault",
+    "react-native",
+    "web"
+  ],
   "type": "module",
   "main": "src/index.ts",
   "types": "src/index.ts",
@@ -14,5 +27,8 @@
   },
   "files": [
     "src"
-  ]
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
 }

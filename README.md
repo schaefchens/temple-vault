@@ -6,7 +6,7 @@ Your app keeps its data – notes, settings, files, audio – in a **vault**: on
 
 That is **plausible deniability**: used as [design.md](docs/design.md#what-a-vault-reveals) describes, a vault gives no proof that it holds more than its user chose to show. What can still give a hidden space away – copies of a vault from different times, a forensic image of the phone – design.md measures, too.
 
-Temple runs inside your app on iOS and Android (React Native) and in the browser (a PWA), with one TypeScript API and React hooks for all three – and as a Rust library. It is open source (Apache 2.0) and young: v1 was built and tested in October 2026, but hasn't had an external security audit yet, and it isn't published on npm or crates.io – you build it from this repository ([install](#install)).
+Temple runs inside your app on iOS and Android (React Native) and in the browser (a PWA), with one TypeScript API and React hooks for all three – and as a Rust library. It is open source (Apache 2.0) and young: v1 was built and tested in October 2026, and 0.1.0 is on npm and crates.io as a preview ([install](#install)) – but it hasn't had an external security audit yet.
 
 ### Made with AI
 
@@ -30,7 +30,7 @@ Temple fits apps whose users are at risk if their data is seen: journals, religi
 - **No recovery:** lost words mean lost data. Your app must get users to write them down.
 - **One device at a time:** a vault can be copied to another device, but Temple doesn't sync or merge.
 - **Limits:** each space's database holds up to 1 GiB (large files go beside it); opening a space takes a tenth of a second to under two seconds, depending on the phone – deliberately, so that words can't be guessed quickly.
-- **Maturity:** not audited yet, and not on npm or crates.io yet.
+- **Maturity:** a preview, not audited yet.
 
 If your app only needs its data encrypted on the device, the phone's own encryption or SQLCipher are simpler:
 
@@ -44,59 +44,64 @@ If your app only needs its data encrypted on the device, the phone's own encrypt
 
 ## Install
 
-Not published yet: build the packages from this repository. You need Node 22 or later and Rust through [rustup](https://rustup.rs).
+Version 0.1.0 is a preview: the API may still change, and Temple waits for its external audit ([above](#made-with-ai)).
 
 ### React Native – iOS and Android
 
-For apps on React Native's New Architecture (tested with React Native 0.88 and Expo SDK 58, not in Expo Go), with Xcode for iOS and the Android NDK for Android. Builds for 64-bit phones and the simulator and emulator; Android from API level 24.
+For apps on React Native's New Architecture – tested with React Native 0.88 and Expo SDK 58; not in Expo Go. The package brings Temple's native library, built for 64-bit phones, the iOS simulator and the Android emulator; Android from API level 24.
 
 ```sh
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-linux-android x86_64-linux-android
-cargo install cargo-ndk
-
-git clone https://github.com/schaefchens/temple-vault.git
-cd temple-vault
-npm install
-npm run build:ios -w @schaefchens/temple-react-native      # the iOS framework
-npm run build:android -w @schaefchens/temple-react-native  # the Android libraries
-mkdir -p ../temple-packages
-npm pack -w @schaefchens/temple -w @schaefchens/temple-react-native -w @schaefchens/temple-react --pack-destination ../temple-packages
+npm install @schaefchens/temple-react-native @schaefchens/temple @ubjs/react-native@0.31.0-6
+npm install @schaefchens/temple-react     # the React hooks, if you want them
+cd ios && pod install                     # with Expo: npx expo prebuild, then npx expo run:ios
 ```
 
-Then in your app – `@ubjs/react-native` loads Temple's native library and must be a direct dependency:
-
-```sh
-npm install ../temple-packages/schaefchens-temple-0.0.0.tgz \
-  ../temple-packages/schaefchens-temple-react-native-0.0.0.tgz \
-  ../temple-packages/schaefchens-temple-react-0.0.0.tgz \
-  @ubjs/react-native@0.31.0-6
-cd ios && pod install          # with Expo: npx expo prebuild, then npx expo run:ios
-```
-
-[examples/react-native](examples/react-native) is a complete Expo app.
+`@ubjs/react-native` loads Temple's native library and must be a direct dependency of the app. [examples/react-native](examples/react-native) is a complete Expo app.
 
 ### Web – a PWA
 
-Temple runs in a web worker and keeps vaults in the browser's private file system (the origin private file system): the page must be served over HTTPS, or from localhost – and WebKit's private sessions have no such file system. Building needs the wasm32 target, a clang that compiles to wasm32 – on macOS Homebrew's `llvm`, which the build finds; on Linux `clang` and `llvm`, named in `CC_wasm32_unknown_unknown=clang AR_wasm32_unknown_unknown=llvm-ar` – and wasm-bindgen-cli at Temple's version. In the clone, after `npm install`:
+Temple runs in a web worker of its own, as wasm, and keeps vaults in the browser's private file system (the origin private file system): the page must be served over HTTPS, or from localhost – and WebKit's private sessions have no such file system.
 
 ```sh
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --locked --version "$(cargo metadata --manifest-path bindings/ffi/Cargo.toml --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')"
-npm run build -w @schaefchens/temple-web
-mkdir -p ../temple-packages
-npm pack -w @schaefchens/temple -w @schaefchens/temple-web -w @schaefchens/temple-react --pack-destination ../temple-packages
+npm install @schaefchens/temple-web @schaefchens/temple
+npm install @schaefchens/temple-react     # the React hooks, if you want them
 ```
 
-Then install the three packages in your app, as for React Native but with `schaefchens-temple-web-0.0.0.tgz` and without `@ubjs/react-native`; Vite takes them as they are, worker and wasm module included. Ask the browser to keep the vault (`navigator.storage.persist()`); [examples/web](examples/web) is a complete PWA.
+Vite takes the package as it is, worker and wasm module included. Ask the browser to keep the vault (`navigator.storage.persist()`); [examples/web](examples/web) is a complete PWA.
 
 ### Rust
 
-```toml
-[dependencies]
-temple-vault = { git = "https://github.com/schaefchens/temple-vault" }
+```sh
+cargo add temple-vault
 ```
 
-It builds SQLite, so it needs a C compiler. The API is documented in the code: `cargo doc --open`.
+It builds SQLite, so it needs a C compiler – for wasm32, a clang that compiles to it. The API is documented on [docs.rs](https://docs.rs/temple-vault).
+
+### From source
+
+To build the native libraries and the wasm module yourself – with Node 22 or later and Rust through [rustup](https://rustup.rs):
+
+```sh
+git clone https://github.com/schaefchens/temple-vault.git
+cd temple-vault
+npm install
+
+# iOS and Android: Xcode, the Android NDK and cargo-ndk
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios aarch64-linux-android x86_64-linux-android
+cargo install cargo-ndk
+npm run build:ios -w @schaefchens/temple-react-native
+npm run build:android -w @schaefchens/temple-react-native
+
+# The web: a clang that compiles to wasm32 – on macOS Homebrew's llvm, which the build finds; on
+# Linux clang and llvm, named in CC_wasm32_unknown_unknown=clang AR_wasm32_unknown_unknown=llvm-ar
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --locked --version "$(cargo metadata --manifest-path bindings/ffi/Cargo.toml --format-version 1 | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')"
+npm run build -w @schaefchens/temple-web
+
+# Packages to install in an app, in place of npm's
+mkdir -p ../temple-packages
+npm pack -w @schaefchens/temple -w @schaefchens/temple-react-native -w @schaefchens/temple-web -w @schaefchens/temple-react --pack-destination ../temple-packages
+```
 
 ## Use
 
@@ -157,7 +162,7 @@ let space = vault.unlock(&words)?.expect("these words open a space");
 
 ## Status
 
-v1 built and tested, October 2026, its format final; its release waits for an external security audit. Temple stays small so it can be audited whole: about 3,200 lines of Rust, of which about 650 are the unsafe bridge to SQLite and a few dozen call the system for file locks and the backup mark. It was made with AI ([above](#made-with-ai)).
+v1 built and tested, October 2026, its format final; 0.1.0 published as a preview, and a release proper waits for an external security audit. Temple stays small so it can be audited whole: about 3,200 lines of Rust, of which about 650 are the unsafe bridge to SQLite and a few dozen call the system for file locks and the backup mark. It was made with AI ([above](#made-with-ai)).
 
 ## Repository
 
