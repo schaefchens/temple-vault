@@ -50,6 +50,10 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     assert(!(await temple.wordsAreValid([...first.slice(0, 11), 2048])), 'an index of 2048 is not');
     // The last word's low 4 bits are the checksum.
     assert(!(await temple.wordsAreValid([...first.slice(0, 11), first[11] ^ 1])), 'a wrong checksum is not');
+    // As zeros, its holes would make "abandon … about", whose checksum is right.
+    const holes = new Array<number>(12);
+    holes[11] = 3;
+    assert(!(await temple.wordsAreValid(holes)), 'an array with holes is not');
   });
 
   await check('typed words never become a vault or a space', async () => {
@@ -215,9 +219,12 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     space = await opened(vault.unlock(first));
   });
 
-  await check('a missing vault is "NotFound"; a taken path "AlreadyExists"', async () => {
+  await check('a missing vault is "NotFound"; a taken path "AlreadyExists"; a name of Temple\'s is refused', async () => {
     await expectError(() => temple.openVault(files.path(`self-test-${tag}-missing.vault`)), 'NotFound');
     await expectError(async () => temple.createVault(a, await temple.generateWords()), 'AlreadyExists');
+    // What a vault is called while it's created: another creation would remove it.
+    const part = files.path(`.self-test-${tag}.temple-part`);
+    await expectError(async () => temple.createVault(part, await temple.generateWords()), 'Io');
   });
 
   let rebuilt!: number[];

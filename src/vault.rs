@@ -25,6 +25,11 @@ use std::sync::{Arc, Mutex};
 /// a space locks. Different bytes there mean another device has opened the vault since.
 const MARKER: u64 = ZONE;
 
+/// How the name of a vault being created ends: `.<name>.temple-part`, which a creation
+/// removes as a crash's leftover. Names ending so are Temple's, never a vault's.
+#[cfg(unix)]
+const PART: &str = ".temple-part";
+
 /// A vault: one file holding any number of spaces, each opened by its own 12 words.
 pub struct Vault {
     pub(crate) file: Arc<VaultFile>,
@@ -42,7 +47,7 @@ impl Vault {
     /// A new vault at `path` with its first space, which comes back open. Fails if something
     /// exists at `path`. The vault is written next to it, as `.<name>.temple-part`, and given
     /// its name once complete, so a crash leaves no half-made vault at `path`; the next try
-    /// removes what it left.
+    /// removes what it left. A name ending in `.temple-part` is refused: it's Temple's.
     #[cfg(unix)]
     pub fn create(path: impl AsRef<Path>, words: &NewWords, setup: Setup) -> Result<(Vault, Space), Error> {
         let key = PhraseKey::from_words(words);
@@ -59,10 +64,14 @@ impl Vault {
     ) -> Result<(Vault, T), Error> {
         let name =
             path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a vault needs a file name"))?;
+        // Another creation would remove it. Without regard to case, as file systems may compare.
+        if name.as_encoded_bytes().to_ascii_lowercase().ends_with(PART.as_bytes()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "names ending in .temple-part are Temple's").into());
+        }
         if fs::symlink_metadata(path).is_ok() {
             return Err(already_exists().into());
         }
-        let partial = path.with_file_name(format!(".{}.temple-part", name.to_string_lossy()));
+        let partial = path.with_file_name(format!(".{}{PART}", name.to_string_lossy()));
         // Left by a creation a crash interrupted – never a vault, as it never got its name –
         // unless another process is still writing it.
         match OpenOptions::new().write(true).open(&partial) {

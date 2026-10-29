@@ -98,7 +98,10 @@ export interface Vault {
 
 /** What one set of 12 words opens: a SQLite database with full-text search, and objects. */
 export interface Space {
-  /** Runs a statement; returns how many rows it changed. Tables named `temple_…` are Temple's. */
+  /**
+   * Runs a statement; returns how many rows it changed. Tables named `temple_…` are Temple's. A transaction is the whole
+   * space's: until it ends, every call on the space – from anywhere in the app – is part of it.
+   */
   execute(sql: string, params?: SqlValue[]): Promise<number>;
   /** Runs statements separated by semicolons, without parameters. */
   executeBatch(sql: string): Promise<void>;
@@ -131,7 +134,7 @@ export interface Space {
   isLocked(): Promise<boolean>;
 }
 
-/** An object written piece by piece. One never finished leaves nothing behind once its space opens again. */
+/** An object written piece by piece. One never finished ends as its space locks, and leaves nothing behind once it opens again. */
 export interface ObjectWriter {
   /** Adds the next piece. A piece that fails ends the object – it may be half written: begin it again. */
   write(bytes: Uint8Array): Promise<void>;

@@ -34,7 +34,8 @@ pub(super) struct Object {
 /// bindings: from [`Space::begin_object`], each piece through [`Space::write_object`], and
 /// stored by [`Space::finish_object`]. Until then nothing points at its blocks: an object
 /// never finished leaves them free from the space's next opening. A piece that fails to be
-/// written ends the object, its blocks free at once; it is begun again.
+/// written ends the object, its blocks free at once; it is begun again. Its key and the piece
+/// it holds are wiped as it drops – the app's to drop, as a lock doesn't reach it.
 pub struct ObjectWriter {
     /// The space it belongs to, by the name of its database.
     space: String,
@@ -157,7 +158,7 @@ impl Space {
         // stay out of use until the next opening, which works out the free ones anew.
         self.as_temple(|db| {
             db.execute(
-                "INSERT INTO temple_objects (key, size, blocks) VALUES (?1, ?2, ?3)",
+                "INSERT INTO main.temple_objects (key, size, blocks) VALUES (?1, ?2, ?3)",
                 params![&object.key.as_bytes()[..], object.size as i64, runs::encode(&object.used)],
             )
         })?;
@@ -219,7 +220,7 @@ impl Space {
     /// during this session never finds them in use twice.
     pub fn delete_object(&self, id: ObjectId) -> Result<(), Error> {
         self.writable()?;
-        let deleted = self.sql(self.db().execute("DELETE FROM temple_objects WHERE id = ?1", [id]))?;
+        let deleted = self.sql(self.db().execute("DELETE FROM main.temple_objects WHERE id = ?1", [id]))?;
         if deleted == 0 {
             return Err(Error::NoSuchObject);
         }
@@ -229,7 +230,7 @@ impl Space {
     pub(super) fn object(&self, id: ObjectId) -> Result<Object, Error> {
         let row = self.sql(
             self.db()
-                .query_row("SELECT key, size, blocks FROM temple_objects WHERE id = ?1", [id], |row| {
+                .query_row("SELECT key, size, blocks FROM main.temple_objects WHERE id = ?1", [id], |row| {
                     Ok((Zeroizing::new(row.get::<_, Vec<u8>>(0)?), row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?))
                 })
                 .optional(),
@@ -248,7 +249,7 @@ impl Space {
 /// The blocks of every object, for working out the free ones. A row Temple didn't write
 /// claims none; reading its object fails.
 pub(crate) fn all_runs(db: &Connection) -> Result<Vec<Run>, Error> {
-    let mut statement = db.prepare("SELECT blocks FROM temple_objects")?;
+    let mut statement = db.prepare("SELECT blocks FROM main.temple_objects")?;
     let mut rows = statement.query([])?;
     let mut all = Vec::new();
     while let Some(row) = rows.next()? {

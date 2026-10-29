@@ -1,6 +1,53 @@
 # Temple reviews
 
-Two reviews, every finding with a **Fixed** or **Open** line: [2026-10-29](#2026-10-29-production-readiness-and-crypto) and [2026-10-28](#2026-10-28-first-review). Severity: **high** – breaks a promise in normal use; **medium** – through a plausible mistake, crash or app bug; **low** – hardening and docs.
+Three reviews, every finding with a **Fixed** or **Open** line: [2026-10-29, a recheck](#2026-10-29-a-recheck), [2026-10-29](#2026-10-29-production-readiness-and-crypto) and [2026-10-28](#2026-10-28-first-review). Severity: **high** – breaks a promise in normal use; **medium** – through a plausible mistake, crash or app bug; **low** – hardening and docs.
+
+## 2026-10-29: a recheck
+
+Status: at commit 8a353dd, release 0.1.0. Another reviewer read temple/ again and reported seven findings, two as P1. Each was checked before it was fixed: five reproduced (**Seen**), the demos' two read in the code (**Where**). All seven hold; on this document's scale the two P1s are one medium and one low. Checking them turned up one more way to fail a lock, fixed with them. Every fix outside the demos comes with a test that fails without it. Line numbers are those of 8a353dd.
+
+### Medium
+
+#### 1. A lock left the objects being written
+
+- **Where:** a writer from `writeObject()` holds its object's key and the piece it fills (`bindings/ffi/src/lib.rs:425`); the bindings' `lock` locked only the space (`:407`). The writer lived on until the app's garbage collector let go of it – in the web's worker, once the page did.
+- **Seen:** after the lock, the writer still held both.
+- **Impact:** an upload the lock stopped as the app was left kept a key of Temple's in memory after the lock, against design.md's "locking wipes its keys" – a key that reads the blocks written so far, until they're reused.
+- **Fixed:** the bindings' `lock` first ends every writer of its space, wiping key and piece. `a_lock_ends_the_objects_being_written`, the bindings crate's first test, which CI now runs. The worker keeps such writers' entries until the page lets go; they hold nothing.
+
+#### 2. Temporary tables came before Temple's
+
+- **Where:** Temple's SQL named `temple_objects`, `temple_fulltext` and the app's FTS5 tables without their database, and SQLite looks in the temporary one first; the authorizer guarded `main` only (`src/space/vfs.rs:511`).
+- **Seen:** after `CREATE TEMP TABLE temple_objects (…)`, `put_object` succeeds and reads back; after the lock the object is gone, `NoSuchObject`. Beyond the report: a temporary table named as one of the app's FTS5 tables – a migration might make one – fails the lock ("table note has no column named note"), and the log's key stays on disk with the session's deleted values.
+- **Fixed:** Temple's SQL names `main`; tables and views named `temple_…` are refused in the temporary database too, and views of such a name in `main`. `temples_sql_names_the_main_database`, `temple_tables_are_temples_to_write`.
+
+#### 3. The demos' uploads could take notes with them
+
+- **Where:** both demos held a transaction open while a file streamed in (`examples/web/src/App.tsx:262`, `examples/react-native/App.tsx:284`). A transaction is the whole connection's, so a note added meanwhile joined it.
+- **Impact:** the note showed as saved, its draft cleared – and went with the upload's rollback: a failed read, or a lock as the page was hidden.
+- **Fixed:** an object streams outside any transaction; only finishing it and its row share one, and the demos' writes run one after another. The API's `execute` says what a transaction takes in.
+
+### Low
+
+- **Creating `notes` removed a vault named `.notes.temple-part`** (`src/vault.rs:65`; the web alike), taking it for what a crash left of a creation. **Seen.** The reviewer's P1; low here, as `.<name>.part` before it: it takes a vault named in Temple's own pattern. **Fixed:** such names are Temple's, in any case; creating or copying a vault to one is refused. `no_vault_takes_the_name_of_one_being_created`.
+- **`useVault` released a path before a late space had locked** (`bindings/react/src/index.ts:83`): a space an unlock opened after the unmount locked without the release waiting for it. **Seen** in the hooks' harness: the next mount opened the vault meanwhile. In apps, the lock goes first in Temple's queue natively, and a second opening on the web retries for two seconds. **Fixed:** the call that opened the space settles once the space has locked. `releases the path only once a space that opened late has locked`.
+- **Words with holes** passed the check – `every` skips them – and the bindings made them 0 (`bindings/js/src/wrap.ts:300`): eleven holes and a 3 are "abandon … about", whose checksum is right. **Seen.** **Fixed:** every position of a copy is checked; the self-test asks.
+- **The React Native demo left out of iOS's backups only vaults it created** (`examples/react-native/App.tsx:70`). **Fixed:** whenever the vault opens; the README's example says so too.
+
+### Second round
+
+The reviewer read the fixes before they were committed: the seven held for the cases reported, and two more findings turned up, both P2 there, both low here and fixed.
+
+- **A rename took the name of Temple's table.** The guard sees only the name a table is renamed from, so `ALTER TABLE ordinary RENAME TO temple_fulltext` went through while Temple hadn't made that table yet – it did at the first lock with an FTS5 table, and that lock then failed ("no such column: name"), the log's key left on disk. **Seen.** It takes a rename into Temple's names. **Fixed:** `temple_fulltext` is made with the space, as `temple_objects` is, and a space from 0.1.0 gets it as it opens; a rename to either fails. `temples_tables_are_there_from_the_start`. A rename to another `temple_…` name still goes through; Temple uses none.
+- **The demos could show a file a rollback had taken back:** `useExecute` ran the queries again inside the transaction, and nothing did after a rollback. **Fixed:** inside a transaction the demos write through the space itself, and the queries run again once it has ended, either way.
+
+### What ran
+
+With both rounds' fixes:
+
+- **Rust:** the suite in release and debug builds (105 tests, the soak runs aside) and on wasm32 (94); the bindings crate's test; clippy and rustfmt for both crates. Each new test failed before its fix.
+- **Apps:** the hooks' 12 tests; the self-test – which now also tries holes and a name of Temple's – and the demos' flows, with the wasm module and the native libraries rebuilt: Playwright in Chromium, Firefox and WebKit, Maestro on the iOS simulator (iOS 26.3) and the Android emulator (Android 16). All passed.
+- **Not run:** fuzzing.
 
 ## 2026-10-29: production readiness and crypto
 

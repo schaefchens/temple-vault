@@ -338,6 +338,12 @@ fn temple_tables_are_temples_to_write() {
         "CREATE TABLE note (body); CREATE TRIGGER sneaking AFTER INSERT ON note BEGIN
              INSERT INTO temple_objects (key, size, blocks) SELECT key, size, blocks FROM temple_objects; END;
          INSERT INTO note VALUES ('x');",
+        // From the recheck: tables and views of Temple's names – a temporary one hid its own.
+        "CREATE TEMP TABLE temple_objects (id INTEGER PRIMARY KEY, key BLOB, size INTEGER, blocks BLOB)",
+        "CREATE TABLE temp.temple_objects (x)",
+        "CREATE TEMP VIEW temple_objects AS SELECT 1 AS id",
+        "CREATE VIEW temple_fulltext AS SELECT 'verse' AS name, 1 AS data",
+        "CREATE VIRTUAL TABLE temp.temple_text USING fts5(body)",
     ] {
         assert!(space.db().execute_batch(sql).is_err(), "{sql}");
     }
@@ -653,6 +659,66 @@ fn every_fts5_table_forgets_deleted_text() {
         assert!(!text.contains("zebrafinchmarker"), "{create}");
         assert!(text.contains("another text"), "{create}");
     }
+}
+
+/// From the recheck: Temple's SQL named tables without their database, and a temporary table
+/// of the same name comes first. An object's row went there, gone after the lock; a temporary
+/// table named as one of the app's FTS5 tables made the lock fail, its log's key left on disk.
+#[test]
+fn temples_sql_names_the_main_database() {
+    let (memory, vault, space) = new_vault();
+    space
+        .db()
+        .execute_batch(
+            "CREATE VIRTUAL TABLE verse USING fts5(body);
+             INSERT INTO verse VALUES ('zebrafinchmarker went home'), ('another text');",
+        )
+        .unwrap();
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    // As if the guard had let it through.
+    space.store().admin = true;
+    space
+        .db()
+        .execute_batch("CREATE TEMP TABLE temple_objects (id INTEGER PRIMARY KEY, key BLOB, size INTEGER, blocks BLOB)")
+        .unwrap();
+    space.store().admin = false;
+    let id = space.put_object(&content(10_000, 5)[..]).unwrap();
+    space
+        .db()
+        .execute_batch("DELETE FROM verse WHERE verse MATCH 'zebrafinchmarker'; CREATE TEMP TABLE verse (body);")
+        .unwrap();
+    let master = space.master_key();
+    space.lock().unwrap();
+    let text = readable(&memory.bytes(), &[master.derive(b"temple/v1/db")]);
+    assert!(!text.contains("zebrafinchmarker"));
+    assert!(text.contains("another text"));
+    drop(vault);
+    let space = unlock(&reopen(&memory), 0).unwrap();
+    assert_eq!(space.read_object(id, 0..10_000).unwrap(), content(10_000, 5));
+}
+
+/// From the recheck, its second round: the guard sees only the name a table had, so a rename
+/// took `temple_fulltext` before Temple made it – and failed the lock, its log's key left on
+/// disk. Temple's tables are there from the start now; a space from before gets them as it
+/// opens.
+#[test]
+fn temples_tables_are_there_from_the_start() {
+    let (_memory, vault, space) = new_vault();
+    let renamed = |space: &Space| {
+        space.db().execute_batch("CREATE TABLE IF NOT EXISTS ordinary (x)").unwrap();
+        space.db().execute_batch("ALTER TABLE ordinary RENAME TO temple_fulltext").is_ok()
+    };
+    assert!(!renamed(&space));
+    // As a space from 0.1.0 was until an FTS5 table locked.
+    space.store().admin = true;
+    space.db().execute_batch("DROP TABLE IF EXISTS temple_fulltext").unwrap();
+    space.store().admin = false;
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    assert!(!renamed(&space));
+    space.db().execute_batch("CREATE VIRTUAL TABLE verse USING fts5(body); INSERT INTO verse VALUES ('x');").unwrap();
+    space.lock().unwrap();
 }
 
 /// From this review: objects crossed the bindings in one buffer. Written in pieces of any

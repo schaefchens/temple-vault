@@ -1,5 +1,5 @@
 # Temple's tests on every push: the Rust suite natively – optimized, and once as a debug build
-# for its overflow checks – and on wasm32, the bindings crate, formatting, clippy, RustSec's
+# for its overflow checks – and on wasm32, the bindings crate's, formatting, clippy, RustSec's
 # advisories, the React hooks, a few minutes of fuzzing per target, and the web demo's
 # Playwright run – Chromium and Firefox on Linux, WebKit on macOS. Weekly, the fuzzers run an
 # hour each. The React Native E2E run needs simulators and stays local:
@@ -31,7 +31,8 @@ jobs:
       - run: cargo fmt --check --manifest-path bindings/ffi/Cargo.toml
       - run: cargo clippy --release --locked --all-targets -- -D warnings
       - run: cargo test --release --locked
-      - run: cargo clippy --manifest-path bindings/ffi/Cargo.toml --locked -- -D warnings
+      - run: cargo clippy --manifest-path bindings/ffi/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo test --manifest-path bindings/ffi/Cargo.toml --locked
 
   rust-debug:
     runs-on: ubuntu-latest

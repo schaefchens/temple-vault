@@ -115,7 +115,7 @@ import { english, toIndices, toWords } from '@schaefchens/temple/words';
 const words = await temple.generateWords();
 show(toWords(words.indices, english).join(' '));
 const { vault, space } = await temple.createVault(path, words);
-await temple.excludeFromBackup(path); // on iOS: a backup would be another copy
+await temple.excludeFromBackup(path); // on iOS: a backup would be another copy – after each openVault too
 
 await space.executeBatch('CREATE TABLE IF NOT EXISTS note (body TEXT)');
 await space.execute('INSERT INTO note (body) VALUES (?)', ['first note']);

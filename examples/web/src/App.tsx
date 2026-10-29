@@ -2,11 +2,11 @@
 // by 12 words, notes in each space's database with full-text search, files as objects.
 // Hiding the page locks the space. `?self-test` runs Temple's self-test here instead.
 
-import { TempleProvider, useExecute, useQuery, useVault, type VaultHandle } from '@schaefchens/temple-react';
+import { TempleProvider, changed, useExecute, useQuery, useVault, type VaultHandle } from '@schaefchens/temple-react';
 import { TempleError, temple, type NewWords, type Space } from '@schaefchens/temple-web';
 import { selfTest, type Check } from '@schaefchens/temple/self-test';
 import { english, toIndices, toWords } from '@schaefchens/temple/words';
-import { useEffect, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 
 const VAULT = 'demo.vault';
 const SCHEMA = `CREATE VIRTUAL TABLE IF NOT EXISTS note USING fts5(body);
@@ -190,6 +190,7 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
     ready ? space : null,
     'SELECT id, object, name, size FROM file ORDER BY id DESC',
   );
+  const write = useWrites();
   const run = (task: () => Promise<unknown>) => void task().catch((e) => setNotice(message(e)));
 
   if (mode === 'change-words') {
@@ -220,7 +221,7 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
           event.preventDefault();
           run(async () => {
             if (!draft.trim()) return;
-            await execute('INSERT INTO note (body) VALUES (?)', [draft.trim()]);
+            await write(() => execute('INSERT INTO note (body) VALUES (?)', [draft.trim()]));
             setDraft('');
           });
         }}
@@ -244,7 +245,9 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
       {notes.rows.map((note) => (
         <div key={note.id} className="row">
           <span className="grow">{note.body}</span>
-          <button onClick={() => run(() => execute('DELETE FROM note WHERE rowid = ?', [note.id]))}>Delete</button>
+          <button onClick={() => run(() => write(() => execute('DELETE FROM note WHERE rowid = ?', [note.id])))}>
+            Delete
+          </button>
         </div>
       ))}
       <h2>Files</h2>
@@ -257,18 +260,21 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
             const file = event.target.files?.[0];
             event.target.value = '';
             if (!file) return;
-            // In pieces as the browser reads them, so that a large file never sits in memory whole.
-            run(() =>
-              transaction(space, async () => {
-                const writer = await space.writeObject();
-                const pieces = file.stream().getReader();
-                for (let piece = await pieces.read(); !piece.done; piece = await pieces.read()) {
-                  await writer.write(piece.value);
-                }
-                const object = await writer.finish();
-                await execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, file.name, file.size]);
-              }),
-            );
+            run(async () => {
+              // In pieces as the browser reads them, so that a large file never sits in memory whole – and outside
+              // any transaction, so that notes needn't wait for it.
+              const writer = await space.writeObject();
+              const pieces = file.stream().getReader();
+              for (let piece = await pieces.read(); !piece.done; piece = await pieces.read()) {
+                await writer.write(piece.value);
+              }
+              await write(() =>
+                transaction(space, async () => {
+                  const object = await writer.finish();
+                  await space.execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, file.name, file.size]);
+                }),
+              );
+            });
           }}
         />
       </label>
@@ -293,10 +299,12 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
           <button
             onClick={() =>
               run(() =>
-                transaction(space, async () => {
-                  await space.deleteObject(file.object);
-                  await execute('DELETE FROM file WHERE id = ?', [file.id]);
-                }),
+                write(() =>
+                  transaction(space, async () => {
+                    await space.deleteObject(file.object);
+                    await space.execute('DELETE FROM file WHERE id = ?', [file.id]);
+                  }),
+                ),
               )
             }
           >
@@ -368,7 +376,23 @@ async function remove(name: string) {
   }
 }
 
-/** Runs statements in one transaction, rolled back if one fails: an object and its row go together. */
+/**
+ * Runs writes one after another: a transaction is the whole space's, and a write made while one is open joins it – and
+ * is rolled back with it.
+ */
+function useWrites() {
+  const last = useRef<Promise<unknown>>(Promise.resolve());
+  return useCallback(<T,>(write: () => Promise<T>): Promise<T> => {
+    const done = last.current.then(write);
+    last.current = done.catch(() => {});
+    return done;
+  }, []);
+}
+
+/**
+ * Runs statements in one transaction, rolled back if one fails: an object and its row go together. Queries run again once
+ * it has ended – committed or rolled back – so they never show what it wrote before then.
+ */
 async function transaction(space: Space, work: () => Promise<void>) {
   await space.execute('BEGIN');
   try {
@@ -377,6 +401,8 @@ async function transaction(space: Space, work: () => Promise<void>) {
   } catch (error) {
     await space.execute('ROLLBACK').catch(() => {});
     throw error;
+  } finally {
+    changed(space);
   }
 }
 

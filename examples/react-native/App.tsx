@@ -3,14 +3,14 @@
 // and a cover hides it while the app isn't active. The link temple-demo://self-test offers
 // Temple's self-test on this device instead.
 
-import { TempleProvider, useExecute, useQuery, useVault, type VaultHandle } from '@schaefchens/temple-react';
+import { TempleProvider, changed, useExecute, useQuery, useVault, type VaultHandle } from '@schaefchens/temple-react';
 import { TempleError, temple, type NewWords, type Space } from '@schaefchens/temple-react-native';
 import { selfTest, type Check } from '@schaefchens/temple/self-test';
 import { english, toIndices, toWords } from '@schaefchens/temple/words';
 import { File, Paths } from 'expo-file-system';
 import * as SecureStore from 'expo-secure-store';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, AppState, Linking, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
@@ -54,6 +54,12 @@ function Demo() {
     setActive(AppState.currentState === 'active');
     return () => subscription.remove();
   }, [lock]);
+  // Every backup would be another copy of the vault: left out whenever it opens – a vault made
+  // before the demo did so, too.
+  const opened = vault.status === 'locked' || vault.status === 'open' ? vault.vault : null;
+  useEffect(() => {
+    if (opened) temple.excludeFromBackup(VAULT).catch((e) => console.warn(message(e)));
+  }, [opened]);
 
   if (!active) return <View style={styles.cover} />;
   switch (vault.status) {
@@ -67,11 +73,7 @@ function Demo() {
           title="A new vault"
           action="Create vault"
           busy="Creating the vault – writing its noise…"
-          onConfirm={async (words) => {
-            await vault.create(words);
-            // Every backup would be another copy of the vault.
-            await temple.excludeFromBackup(VAULT);
-          }}
+          onConfirm={(words) => vault.create(words)}
         />
       );
     case 'locked':
@@ -219,11 +221,12 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
     ready ? space : null,
     'SELECT id, object, name, size FROM file ORDER BY id DESC',
   );
+  const write = useWrites();
   const run = (task: () => Promise<unknown>) => void task().catch((e) => setNotice(message(e)));
   const add = () =>
     run(async () => {
       if (!draft.trim()) return;
-      await execute('INSERT INTO note (body) VALUES (?)', [draft.trim()]);
+      await write(() => execute('INSERT INTO note (body) VALUES (?)', [draft.trim()]));
       setDraft('');
     });
 
@@ -273,23 +276,29 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
       {notes.rows.map((note) => (
         <View key={note.id} style={styles.row}>
           <Text style={styles.note}>{note.body}</Text>
-          <Button label="Delete" onPress={() => run(() => execute('DELETE FROM note WHERE rowid = ?', [note.id]))} />
+          <Button
+            label="Delete"
+            onPress={() => run(() => write(() => execute('DELETE FROM note WHERE rowid = ?', [note.id])))}
+          />
         </View>
       ))}
       <Text style={styles.subtitle}>Files</Text>
       <Button
         label="Attach sample file"
         onPress={() =>
-          run(() =>
-            transaction(space, async () => {
-              // In pieces, as a download arrives: a large file never sits in memory whole.
-              const bytes = sample(256 * 1024);
-              const writer = await space.writeObject();
-              for (let at = 0; at < bytes.length; at += 64 * 1024) await writer.write(bytes.subarray(at, at + 64 * 1024));
-              const object = await writer.finish();
-              await execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, `sample-${object}.bin`, bytes.length]);
-            }),
-          )
+          run(async () => {
+            // In pieces, as a download arrives: a large file never sits in memory whole – and outside any
+            // transaction, so that notes needn't wait for it.
+            const bytes = sample(256 * 1024);
+            const writer = await space.writeObject();
+            for (let at = 0; at < bytes.length; at += 64 * 1024) await writer.write(bytes.subarray(at, at + 64 * 1024));
+            await write(() =>
+              transaction(space, async () => {
+                const object = await writer.finish();
+                await space.execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, `sample-${object}.bin`, bytes.length]);
+              }),
+            );
+          })
         }
       />
       {files.rows.map((file) => (
@@ -311,10 +320,12 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
             label="Remove"
             onPress={() =>
               run(() =>
-                transaction(space, async () => {
-                  await space.deleteObject(file.object);
-                  await execute('DELETE FROM file WHERE id = ?', [file.id]);
-                }),
+                write(() =>
+                  transaction(space, async () => {
+                    await space.deleteObject(file.object);
+                    await space.execute('DELETE FROM file WHERE id = ?', [file.id]);
+                  }),
+                ),
               )
             }
           />
@@ -406,7 +417,23 @@ function Button({ label, onPress }: { label: string; onPress(): void }) {
   );
 }
 
-/** Runs statements in one transaction, rolled back if one fails: an object and its row go together. */
+/**
+ * Runs writes one after another: a transaction is the whole space's, and a write made while one is open joins it – and
+ * is rolled back with it.
+ */
+function useWrites() {
+  const last = useRef<Promise<unknown>>(Promise.resolve());
+  return useCallback(<T,>(write: () => Promise<T>): Promise<T> => {
+    const done = last.current.then(write);
+    last.current = done.catch(() => {});
+    return done;
+  }, []);
+}
+
+/**
+ * Runs statements in one transaction, rolled back if one fails: an object and its row go together. Queries run again once
+ * it has ended – committed or rolled back – so they never show what it wrote before then.
+ */
 async function transaction(space: Space, work: () => Promise<void>) {
   await space.execute('BEGIN');
   try {
@@ -415,6 +442,8 @@ async function transaction(space: Space, work: () => Promise<void>) {
   } catch (error) {
     await space.execute('ROLLBACK').catch(() => {});
     throw error;
+  } finally {
+    changed(space);
   }
 }
 

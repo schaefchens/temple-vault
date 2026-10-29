@@ -101,6 +101,9 @@ impl Space {
             store.init_free(objects)?;
             store.read_only = false;
             store.finish_open()?;
+            drop(store);
+            // A space from 0.1.0 got this table only once an FTS5 table locked.
+            space.sql(space.db().execute_batch(fulltext::SCHEMA))?;
         }
         space.store.lock().unwrap().admin = false;
         space.ready = true;
@@ -151,13 +154,13 @@ impl Space {
         Space { db: None, store, file, name, key, block, access, claim, stop, ready: false, closed: false }
     }
 
-    /// The space's database: SQLite with full-text search. Tables named `temple_…` are
-    /// Temple's. Pragmas that would break the space's guarantees – journal mode, checkpoints,
-    /// `synchronous`, `secure_delete` and the like – are refused. For search, use FTS5:
-    /// locking turns on its `secure-delete` option, where FTS3 and FTS4 would keep deleted
-    /// terms in their index. A page that isn't the one the space recorded – in a copy of the
-    /// vault taken mid-write, or put back by someone – fails to read with SQLite's I/O error,
-    /// which [`Space::explain`] tells apart.
+    /// The space's database: SQLite with full-text search. Tables and views named `temple_…`
+    /// are Temple's, in the temporary database too. Pragmas that would break the space's
+    /// guarantees – journal mode, checkpoints, `synchronous`, `secure_delete` and the like –
+    /// are refused. For search, use FTS5: locking turns on its `secure-delete` option, where
+    /// FTS3 and FTS4 would keep deleted terms in their index. A page that isn't the one the
+    /// space recorded – in a copy of the vault taken mid-write, or put back by someone – fails
+    /// to read with SQLite's I/O error, which [`Space::explain`] tells apart.
     pub fn db(&self) -> &Connection {
         self.db.as_ref().expect("a space's database is open until the space locks")
     }
@@ -485,6 +488,7 @@ fn connect(name: &str, how: Open, store: &Arc<Mutex<Store>>) -> Result<Connectio
         }
         db.execute_batch("PRAGMA page_size = 4096; PRAGMA locking_mode = EXCLUSIVE; PRAGMA journal_mode = OFF;")?;
         db.execute_batch(objects::SCHEMA)?;
+        db.execute_batch(fulltext::SCHEMA)?;
     } else {
         db.execute_batch("PRAGMA locking_mode = EXCLUSIVE")?;
     }

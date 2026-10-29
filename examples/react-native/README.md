@@ -10,4 +10,4 @@ npx expo run:ios                     # or: npx expo run:android
 
 E2E: `tools/e2e_react_native.sh` builds for release and runs the Maestro flows in `e2e/`.
 
-Every backup is another copy of the vault (design.md, limits): the demo leaves its vault out of iOS's backups with `excludeFromBackup`, and turns Android's off in app.json.
+Every backup is another copy of the vault (design.md, limits): the demo leaves its vault out of iOS's backups with `excludeFromBackup` whenever it opens, and turns Android's off in app.json.

@@ -4,7 +4,7 @@
 //! hosts the module, where vaults live in the origin private file system.
 
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use temple_vault::rusqlite::types::{ToSqlOutput, ValueRef};
 use temple_vault::rusqlite::{self, Connection, ToSql, params_from_iter};
 use zeroize::Zeroizing;
@@ -269,18 +269,24 @@ pub struct Space {
     space: Mutex<Option<temple_vault::Space>>,
     /// Stops the work running, for a lock.
     interrupt: temple_vault::Interrupt,
+    /// Objects begun here: a lock ends those not finished.
+    writers: Mutex<Vec<Weak<ObjectWriter>>>,
 }
 
 impl Space {
     fn new(space: temple_vault::Space) -> Arc<Space> {
         let interrupt = space.interrupt_handle();
-        Arc::new(Space { space: Mutex::new(Some(space)), interrupt })
+        Arc::new(Space { space: Mutex::new(Some(space)), interrupt, writers: Mutex::default() })
     }
 
     /// The space, or nothing once it has locked. A panic while it was held changes nothing
     /// Temple relies on: it checks what it reads.
     pub(crate) fn guard(&self) -> MutexGuard<'_, Option<temple_vault::Space>> {
         self.space.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn writers(&self) -> MutexGuard<'_, Vec<Weak<ObjectWriter>>> {
+        self.writers.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Runs `work` on the open space, off the JS thread.
@@ -318,10 +324,19 @@ impl Space {
     }
 
     /// A new object written piece by piece – content too large for one buffer, such as a
-    /// download – stored once finished.
+    /// download – stored once finished. Locking the space ends it.
     pub async fn begin_object(self: Arc<Self>) -> Result<Arc<ObjectWriter>, TempleError> {
-        let writer = self.clone().with(|space| Ok(space.begin_object()?)).await?;
-        Ok(Arc::new(ObjectWriter { space: self, writer: Mutex::new(Some(writer)) }))
+        let this = self.clone();
+        // Known to the space before the call ends, so that a lock right after ends it too.
+        self.with(move |space| {
+            let writer =
+                Arc::new(ObjectWriter { space: this.clone(), writer: Mutex::new(Some(space.begin_object()?)) });
+            let mut writers = this.writers();
+            writers.retain(|writer| writer.strong_count() > 0);
+            writers.push(Arc::downgrade(&writer));
+            Ok(writer)
+        })
+        .await
     }
 
     /// The bytes of an object from `start` up to `end`, or up to its end if that's further.
@@ -406,9 +421,16 @@ impl Space {
     /// moves to the background. Nothing happens if it has locked already.
     pub async fn lock(self: Arc<Self>) -> Result<(), TempleError> {
         self.interrupt.interrupt();
-        background::run_first(move || match self.guard().take() {
-            Some(space) => Ok(space.lock()?),
-            None => Ok(()),
+        background::run_first(move || {
+            // Objects not finished end here: their keys and the pieces they hold are wiped now,
+            // not once the app's garbage collector gets to their writers.
+            for writer in self.writers().drain(..).filter_map(|writer| writer.upgrade()) {
+                drop(writer.writer().take());
+            }
+            match self.guard().take() {
+                Some(space) => Ok(space.lock()?),
+                None => Ok(()),
+            }
         })
         .await
     }
@@ -419,8 +441,8 @@ impl Space {
     }
 }
 
-/// An object written piece by piece, from [`Space::begin_object`]. One never finished leaves
-/// nothing behind once its space opens again.
+/// An object written piece by piece, from [`Space::begin_object`]. One never finished ends as
+/// its space locks, and leaves nothing behind once the space opens again.
 #[derive(uniffi::Object)]
 pub struct ObjectWriter {
     space: Arc<Space>,
@@ -497,4 +519,47 @@ fn query(db: &Connection, sql: &str, params: &[Value]) -> rusqlite::Result<Rows>
         rows.push((0..columns.len()).map(|i| row.get_ref(i).map(Value::from)).collect::<rusqlite::Result<_>>()?);
     }
     Ok(Rows { columns, rows })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    /// Runs a call to its end, this thread waiting while Temple's works.
+    fn wait<T>(call: impl Future<Output = T>) -> T {
+        struct Unpark(std::thread::Thread);
+        impl Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut call = pin!(call);
+        loop {
+            if let Poll::Ready(value) = call.as_mut().poll(&mut Context::from_waker(&waker)) {
+                return value;
+            }
+            std::thread::park();
+        }
+    }
+
+    /// From the recheck: an object still being written kept its key and its last piece after
+    /// its space locked, until the app's garbage collector let go of the writer.
+    #[test]
+    fn a_lock_ends_the_objects_being_written() {
+        // Any file of two zones takes a space – a small one, without a new vault's reserve.
+        let path = std::env::temp_dir().join(format!("temple-ffi-{}.vault", std::process::id()));
+        std::fs::write(&path, vec![0u8; 2 << 20]).unwrap();
+        let vault = wait(open_vault(path.to_string_lossy().into_owned(), false)).unwrap();
+        let space = wait(vault.create_space(generate_words(), 0)).unwrap();
+        let writer = wait(space.clone().begin_object()).unwrap();
+        wait(writer.clone().write(vec![7; 1000])).unwrap();
+        wait(space.lock()).unwrap();
+        let ended = writer.writer().is_none();
+        std::fs::remove_file(&path).unwrap();
+        assert!(ended, "the object's key and piece outlived the lock");
+        assert!(matches!(wait(writer.finish()), Err(TempleError::Locked(_))));
+    }
 }

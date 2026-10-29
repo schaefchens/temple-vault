@@ -35,6 +35,8 @@ class FakeSpace implements Space {
   queries = 0;
   failLock: TempleError | null = null;
   failQuery: TempleError | null = null;
+  /** Locking waits for this, if set. */
+  pause: Promise<void> | null = null;
 
   async execute(_sql: string, params: SqlValue[] = []) {
     this.rows.push({ body: params[0] ?? null });
@@ -78,6 +80,7 @@ class FakeSpace implements Space {
   }
   async copyInto() {}
   async lock() {
+    await this.pause;
     this.locked = true;
     if (this.failLock) throw this.failLock;
   }
@@ -91,6 +94,8 @@ class FakeVault implements Vault {
   spaces: FakeSpace[] = [];
   /** Unlocking waits for this, if set. */
   pause: Promise<void> | null = null;
+  /** Locking its spaces waits for this, if set. */
+  lockPause: Promise<void> | null = null;
 
   constructor(readonly temple: FakeTemple) {}
 
@@ -116,6 +121,7 @@ class FakeVault implements Vault {
     this.temple.openNow--;
   }
   open(space: FakeSpace) {
+    space.pause = this.lockPause;
     this.spaces.push(space);
     return space;
   }
@@ -265,6 +271,35 @@ describe('useVault', () => {
     expect(temple.vaults.length).toBe(2);
     expect(temple.vaults[0].closed).toBe(true);
     expect(temple.openMost).toBe(1);
+  });
+
+  // From the recheck of 2026-10-29: a space that opened after its mount had ended was locked
+  // without the path waiting for it, so the next mount could open the vault meanwhile.
+  it('releases the path only once a space that opened late has locked', async () => {
+    const temple = new FakeTemple();
+    const first = mount(temple);
+    await locked(first.result);
+    const [unlocking, locking] = [gate(), gate()];
+    const vault = temple.vaults[0];
+    vault.pause = unlocking.opened;
+    vault.lockPause = locking.opened;
+    let unlocked!: Promise<boolean>;
+    act(() => {
+      unlocked = first.result.current.unlock(WORDS);
+    });
+    first.unmount();
+    const second = mount(temple);
+    await act(async () => {
+      unlocking.open();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(vault.spaces.length).toBe(1);
+    expect(temple.opening).toBe(1);
+    locking.open();
+    expect(await unlocked).toBe(true);
+    await locked(second.result);
+    expect(vault.spaces[0].locked).toBe(true);
+    expect(vault.closed).toBe(true);
   });
 
   it('opens the vault once under StrictMode, which mounts every effect twice', async () => {

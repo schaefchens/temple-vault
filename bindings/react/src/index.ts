@@ -42,15 +42,16 @@ export type VaultHandle = VaultState & {
 
 /**
  * What one mount of `useVault` holds. `locks` counts lock requests: a space a call opens after
- * one locks at once. Once done, whatever arrives late is let go, and the path is released only
- * when the mount's running calls have settled.
+ * one locks at once. Once done, whatever arrives late is let go – the call that brought it
+ * settles once it has – and the path is released only when the mount's running calls have
+ * settled.
  */
 type Session = {
   state: VaultState;
   done: boolean;
   locks: number;
   running: Set<Promise<unknown>>;
-  show(next: VaultState): void;
+  show(next: VaultState): Promise<void>;
 };
 
 // Per path, when its last user will have let go: on the web a file opens once at a time,
@@ -67,7 +68,7 @@ export function useVault(path: string, options?: { readOnly?: boolean }): VaultH
   const readOnly = options?.readOnly ?? false;
   const temple = useTemple();
   const [state, setState] = useState<VaultState>({ status: 'opening' });
-  const session = useRef<Session>({ state, done: false, locks: 0, running: new Set(), show: setState });
+  const session = useRef<Session>({ state, done: false, locks: 0, running: new Set(), show: async (next) => setState(next) });
 
   useEffect(() => {
     let release!: () => void;
@@ -80,11 +81,8 @@ export function useVault(path: string, options?: { readOnly?: boolean }): VaultH
       done: false,
       locks: 0,
       running: new Set(),
-      show(next) {
-        if (current.done) {
-          void letGo(next);
-          return;
-        }
+      async show(next) {
+        if (current.done) return letGo(next);
         current.state = next;
         setState(next);
       },
@@ -179,7 +177,7 @@ export function useVault(path: string, options?: { readOnly?: boolean }): VaultH
           await state.space.lock();
         } finally {
           // Closed even when locking failed, as when another device took over.
-          mount.show({ status: 'locked', vault: state.vault });
+          await mount.show({ status: 'locked', vault: state.vault });
         }
       }),
     [],
@@ -190,12 +188,9 @@ export function useVault(path: string, options?: { readOnly?: boolean }): VaultH
 
 /** A space a call opened: shown – or, if a lock was asked for meanwhile, locked at once. */
 async function show(mount: Session, locks: number, vault: Vault, space: Space) {
-  if (mount.locks === locks) {
-    mount.show({ status: 'open', vault, space });
-    return;
-  }
+  if (mount.locks === locks) return mount.show({ status: 'open', vault, space });
   await space.lock().catch(() => {});
-  mount.show({ status: 'locked', vault });
+  await mount.show({ status: 'locked', vault });
 }
 
 const closed = new WeakSet<Vault>();

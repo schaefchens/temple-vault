@@ -493,8 +493,10 @@ unsafe extern "C" fn x_wal_hook(
 }
 
 /// Refuses the app's SQL what would break Temple's tables, `temple_…` in the main database:
-/// writing their rows; creating, dropping or altering them; triggers on them. Deleting rows
-/// stays the app's – an object's row may go in one transaction with the app's own.
+/// writing their rows; creating, dropping or altering them; triggers on them. The names are
+/// Temple's in the temporary database too, for tables and views alike – though Temple's own
+/// SQL names `main`, past anything there that would hide its tables. Deleting rows stays the
+/// app's – an object's row may go in one transaction with the app's own.
 pub(crate) fn guard_tables(db: &Connection, store: &Arc<Mutex<Store>>) {
     // The space holds `store` for as long as `db` is open.
     unsafe { ffi::sqlite3_set_authorizer(db.handle(), Some(x_authorize), Arc::as_ptr(store) as *mut c_void) };
@@ -512,6 +514,9 @@ unsafe extern "C" fn x_authorize(
         ffi::SQLITE_INSERT
         | ffi::SQLITE_UPDATE
         | ffi::SQLITE_CREATE_TABLE
+        | ffi::SQLITE_CREATE_TEMP_TABLE
+        | ffi::SQLITE_CREATE_VIEW
+        | ffi::SQLITE_CREATE_TEMP_VIEW
         | ffi::SQLITE_DROP_TABLE
         | ffi::SQLITE_CREATE_VTABLE
         | ffi::SQLITE_DROP_VTABLE => (first, false),
@@ -521,11 +526,12 @@ unsafe extern "C" fn x_authorize(
         _ => return ffi::SQLITE_OK,
     };
     let name = |text: *const c_char| (!text.is_null()).then(|| unsafe { CStr::from_ptr(text) }.to_bytes());
-    let main = any_schema || name(schema).is_none_or(|schema| schema == b"main");
+    // Not an attached database, such as the one VACUUM fills.
+    let ours = any_schema || name(schema).is_none_or(|schema| schema == b"main" || schema == b"temp");
     let temple =
         name(table).and_then(|table| table.get(..7)).is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"temple_"));
     let admin = || unsafe { &*(store as *const Mutex<Store>) }.lock().is_ok_and(|store| store.admin);
-    if main && temple && !admin() { ffi::SQLITE_DENY } else { ffi::SQLITE_OK }
+    if ours && temple && !admin() { ffi::SQLITE_DENY } else { ffi::SQLITE_OK }
 }
 
 fn register() -> bool {

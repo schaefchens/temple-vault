@@ -260,7 +260,8 @@ export function wrap(binding: Binding): Temple {
       return new WrappedNewWords(binding.generateWords());
     },
     async wordsAreValid(words: number[]) {
-      return indices(words) !== null && binding.wordsAreValid(words);
+      const checked = indices(words);
+      return checked !== null && binding.wordsAreValid(checked);
     },
     async createVault(path: string, words: NewWords, options?: { room?: number }) {
       const { vault, space } = await run(() => binding.createVault(path, fresh(words), room(options)));
@@ -296,10 +297,14 @@ function room(options?: { room?: number }): bigint {
   return whole(options?.room ?? 0, 'room');
 }
 
-/** Words as they cross into Rust: 12 whole numbers below 2048, or null – the bindings would turn 65536 or 0.5 into 0. */
+/**
+ * Words as they cross into Rust: 12 whole numbers below 2048, or null – the bindings would turn 65536, 0.5 or a hole in
+ * the array into 0. A copy, each position read once: `every` skips holes.
+ */
 function indices(words: number[]): number[] | null {
-  const valid = Array.isArray(words) && words.length === 12;
-  return valid && words.every((index) => Number.isInteger(index) && index >= 0 && index < 2048) ? words : null;
+  if (!Array.isArray(words) || words.length !== 12) return null;
+  const copy = Array.from(words);
+  return copy.every((index) => Number.isInteger(index) && index >= 0 && index < 2048) ? copy : null;
 }
 
 function valid(words: number[]): number[] {

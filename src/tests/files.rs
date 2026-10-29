@@ -52,6 +52,25 @@ fn a_creation_a_crash_interrupted_leaves_nothing_behind() {
     assert_eq!(names, ["reading"]);
 }
 
+/// From the recheck: creating `reading` removed a vault named `.reading.temple-part`, as if a
+/// crash had left it there. Names ending so are Temple's: no vault is created or copied under
+/// one.
+#[test]
+fn no_vault_takes_the_name_of_one_being_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let refused =
+        |result: Result<(), Error>| matches!(result, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput);
+    for name in [".reading.temple-part", "Reading.TEMPLE-PART"] {
+        let created = Vault::create(dir.path().join(name), &phrase(0).0, Setup::default());
+        assert!(refused(created.map(drop)), "{name}");
+    }
+    let (_vault, space) = create(&dir.path().join("reading"));
+    assert!(refused(space.copy_to_new_vault(dir.path().join(".copy.temple-part"), None).map(drop)));
+    space.lock().unwrap();
+    let names: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+    assert_eq!(names, ["reading"]);
+}
+
 #[test]
 fn a_vault_file_has_no_sparse_region() {
     let dir = tempfile::tempdir().unwrap();

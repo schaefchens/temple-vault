@@ -116,7 +116,7 @@ impl Space {
         }
         self.as_temple(|db| {
             db.execute(
-                "UPDATE temple_objects SET key = ?2, blocks = ?3 WHERE id = ?1",
+                "UPDATE main.temple_objects SET key = ?2, blocks = ?3 WHERE id = ?1",
                 rusqlite::params![id, &key.as_bytes()[..], runs::encode(&runs)],
             )
         })?;
@@ -125,7 +125,7 @@ impl Space {
 }
 
 fn objects_with_sizes(db: &Connection) -> rusqlite::Result<Vec<(ObjectId, u64)>> {
-    let mut statement = db.prepare("SELECT id, size FROM temple_objects ORDER BY id")?;
+    let mut statement = db.prepare("SELECT id, size FROM main.temple_objects ORDER BY id")?;
     let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get::<_, i64>(1)? as u64)))?;
     rows.collect()
 }

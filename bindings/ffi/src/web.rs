@@ -70,10 +70,14 @@ pub(crate) async fn copy_to_new_vault(
 
 /// A fresh `.<name>.temple-part` and a handle to it, after removing what a closed tab left
 /// there – unless another tab still writes it, whose handle keeps it from being removed.
+/// Names ending in `.temple-part` are Temple's: another creation would remove them.
 async fn start(
     dir: &FileSystemDirectoryHandle,
     name: &str,
 ) -> Result<(FileSystemFileHandle, FileSystemSyncAccessHandle), TempleError> {
+    if name.to_ascii_lowercase().ends_with(".temple-part") {
+        return Err(TempleError::Io("names ending in .temple-part are Temple's".into()));
+    }
     match file(dir, name, false).await {
         Err(TempleError::NotFound(_)) => {}
         Ok(_) => return Err(TempleError::AlreadyExists("something exists at the vault's path".into())),
