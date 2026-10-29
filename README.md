@@ -4,13 +4,15 @@ Encrypted storage for apps whose users need their data to stay private – even 
 
 Your app keeps its data – notes, settings, files, audio – in a **vault**: one file on the device. Twelve words open it, much like a crypto wallet's recovery phrase. Without them the file is noise: nobody can read it, or tell what or how much is in it. A vault can hold several **spaces**, each opened by its own twelve words, and opening one shows nothing of the others. Someone forced to hand over their words can open an everyday space while a second one stays hidden.
 
+That is **plausible deniability**: used as [design.md](docs/design.md#what-a-vault-reveals) describes, a vault gives no proof that it holds more than its user chose to show. What can still give a hidden space away – copies of a vault from different times, a forensic image of the phone – design.md measures, too.
+
 Temple runs inside your app on iOS and Android (React Native) and in the browser (a PWA), with one TypeScript API and React hooks for all three – and as a Rust library. It is open source (Apache 2.0) and young: v1 was built and tested in October 2026, but hasn't had an external security audit yet, and it isn't published on npm or crates.io – you build it from this repository ([install](#install)).
 
 ## What it gives your app
 
 - **A database in every space:** SQLite – tables, SQL, full-text search – plus room for large files such as audio or documents. Everything is encrypted, piece by piece.
 - **Twelve words instead of passwords:** Temple makes them; the user writes them down. A typo is caught 15 times in 16. For everyday use, the app can keep a key behind Face ID or the fingerprint sensor ("quick unlock").
-- **Hidden spaces:** any number per vault, and nothing in the file counts them. Random padding around the spaces keeps the file's size from telling much.
+- **Hidden spaces – plausible deniability:** any number per vault, and nothing in the file counts them. Random padding around the spaces keeps the file's size from telling much.
 - **Deleted means gone:** once a space locks, deleted data can't be read again – not even with its words.
 - **Crash-safe:** a crash or a dead battery keeps everything the app committed.
 - **On the device, offline:** no server, no account. A vault is a file: it can be moved, copied, kept or left out of backups.
@@ -32,7 +34,8 @@ If your app only needs its data encrypted on the device, the phone's own encrypt
 | --- | --- | --- |
 | **The phone's own encryption** – iOS Data Protection, Android's file-based encryption | Free and automatic; keys in the phone's secure hardware | Protects data mainly while the phone is locked: once it's unlocked, or the passcode given, the app's data is readable. One secret for everything, nothing hidden |
 | **SQLCipher** – encrypted SQLite, e.g. through expo-sqlite or op-sqlite | Mature (since 2008), fast, widely used | One password per database: whoever gets it gets everything. No hidden areas, large files only as blobs inside the database; choosing passwords and handling keys is up to you |
-| **VeraCrypt** hidden volumes | The established tool for hidden data, audited | Made for desktop systems, mounted through system drivers – nothing a mobile or web app can embed. Fixed size, one hidden volume |
+| **VeraCrypt** hidden volumes | The established tool for plausible deniability, audited | Made for desktop systems, mounted through system drivers – nothing a mobile or web app can embed. Fixed size, one hidden volume |
+| **Shufflecake** – hidden volumes for Linux | Plausible deniability for several hidden volumes on one disk, each under its own key, their number hidden; any filesystem; a peer-reviewed design (ACM CCS 2023), open source | Runs in the Linux kernel on whole disks or partitions – not usable inside an iOS, Android or web app today. A research project |
 | **Your own**, with libsodium or WebCrypto | Full control, small | Easy to get subtly wrong: nonces used twice, deleted data surviving in journals and logs, file sizes and times giving hidden data away, crashes halfway through a write |
 
 ## Install
