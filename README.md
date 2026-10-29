@@ -8,6 +8,10 @@ That is **plausible deniability**: used as [design.md](docs/design.md#what-a-vau
 
 Temple runs inside your app on iOS and Android (React Native) and in the browser (a PWA), with one TypeScript API and React hooks for all three – and as a Rust library. It is open source (Apache 2.0) and young: v1 was built and tested in October 2026, but hasn't had an external security audit yet, and it isn't published on npm or crates.io – you build it from this repository ([install](#install)).
 
+### Made with AI
+
+Temple was written with an AI model – Anthropic's Claude, through Claude Code – under its maintainer's direction: the code, its tests and these documents. Its tests run in CI on every change and have passed on the iOS simulator, the Android emulator and in three browsers; the reviews in [docs/review.md](docs/review.md) record what was checked and fixed. No independent expert has audited it yet: weigh that before your users' safety depends on it.
+
 ## What it gives your app
 
 - **A database in every space:** SQLite – tables, SQL, full-text search – plus room for large files such as audio or documents. Everything is encrypted, piece by piece.
@@ -153,7 +157,7 @@ let space = vault.unlock(&words)?.expect("these words open a space");
 
 ## Status
 
-v1 built and tested, October 2026, its format final; its release waits for an external security audit. Temple stays small so it can be audited whole: about 3,200 lines of Rust, of which about 650 are the unsafe bridge to SQLite and a few dozen call the system for file locks and the backup mark. First user: the Hosana app; Temple depends on nothing from it.
+v1 built and tested, October 2026, its format final; its release waits for an external security audit. Temple stays small so it can be audited whole: about 3,200 lines of Rust, of which about 650 are the unsafe bridge to SQLite and a few dozen call the system for file locks and the backup mark. It was made with AI ([above](#made-with-ai)).
 
 ## Repository
 
