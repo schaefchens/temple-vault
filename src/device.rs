@@ -4,7 +4,7 @@
 use std::io;
 
 #[cfg(unix)]
-pub(crate) use file::FileDevice;
+pub(crate) use file::{FileDevice, exclude_from_backup};
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 pub(crate) use web::OpfsDevice;
 
@@ -16,6 +16,14 @@ pub(crate) trait Device: Send + Sync {
     fn len(&self) -> io::Result<u64>;
     /// Whether the vault's path now leads elsewhere, as when a sync app replaced the file.
     fn replaced(&self) -> bool;
+    /// Locks the file against other processes while a space is open – shared for reading,
+    /// exclusive for writing – so that none writes beside this one between the opening
+    /// marker's checks. `ResourceBusy` if another process holds it.
+    fn hold(&self, _shared: bool) -> io::Result<()> {
+        Ok(())
+    }
+    /// Lets go of the lock [`Device::hold`] took.
+    fn release(&self) {}
 }
 
 #[cfg(unix)]
@@ -23,6 +31,7 @@ mod file {
     use super::Device;
     use std::fs::{self, File};
     use std::io;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{FileExt, MetadataExt};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -92,6 +101,72 @@ mod file {
                 Err(_) => true,
             }
         }
+
+        /// `flock` itself: Rust's `File::try_lock` has none on Android. Where the file system
+        /// has no locks, the opening marker alone tells.
+        fn hold(&self, shared: bool) -> io::Result<()> {
+            let how = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
+            if unsafe { libc::flock(self.file.as_raw_fd(), how | libc::LOCK_NB) } == 0 {
+                return Ok(());
+            }
+            match io::Error::last_os_error() {
+                e if e.kind() == io::ErrorKind::WouldBlock => {
+                    Err(io::Error::new(io::ErrorKind::ResourceBusy, "another process has a space of the vault open"))
+                }
+                _ => Ok(()),
+            }
+        }
+
+        fn release(&self) {
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+
+    /// Backups leave the file out: the mark iOS and macOS keep for it.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn exclude_from_backup(path: &Path) -> io::Result<bool> {
+        use std::ffi::c_void;
+        use std::os::unix::ffi::OsStrExt;
+        use std::ptr;
+
+        type Ref = *const c_void;
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            static kCFURLIsExcludedFromBackupKey: Ref;
+            static kCFBooleanTrue: Ref;
+            fn CFURLCreateFromFileSystemRepresentation(allocator: Ref, path: *const u8, len: isize, dir: u8) -> Ref;
+            fn CFURLSetResourcePropertyForKey(url: Ref, key: Ref, value: Ref, error: *mut Ref) -> u8;
+            fn CFRelease(object: Ref);
+        }
+
+        // Missing files fail as anywhere else, not with Core Foundation's error.
+        fs::metadata(path)?;
+        let bytes = path.as_os_str().as_bytes();
+        let url =
+            unsafe { CFURLCreateFromFileSystemRepresentation(ptr::null(), bytes.as_ptr(), bytes.len() as isize, 0) };
+        if url.is_null() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a file path"));
+        }
+        let mut error: Ref = ptr::null();
+        let marked =
+            unsafe { CFURLSetResourcePropertyForKey(url, kCFURLIsExcludedFromBackupKey, kCFBooleanTrue, &mut error) };
+        unsafe {
+            if !error.is_null() {
+                CFRelease(error);
+            }
+            CFRelease(url);
+        }
+        if marked == 0 {
+            return Err(io::Error::other("the system kept the file in its backups"));
+        }
+        Ok(true)
+    }
+
+    /// No mark elsewhere: on Android, the app's manifest leaves files out of backups.
+    #[cfg(not(target_vendor = "apple"))]
+    pub(crate) fn exclude_from_backup(path: &Path) -> io::Result<bool> {
+        fs::metadata(path)?;
+        Ok(false)
     }
 }
 

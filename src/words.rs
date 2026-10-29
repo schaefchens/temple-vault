@@ -1,9 +1,10 @@
 //! The 12 words that open a space.
 
 use crate::Error;
-use crate::crypto::random;
+use crate::crypto::{random, wiping_stack};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::ops::Deref;
 use zeroize::Zeroize;
 
 /// The 12 words that open a space, as indices into a list of 2048 words: 128 random bits
@@ -15,14 +16,35 @@ pub struct Words {
     bits: Box<[u8; 16]>,
 }
 
-impl Words {
-    /// 12 fresh words.
-    pub fn generate() -> Words {
+/// Fresh words from the system's random source – the only words a space is created with or
+/// changes to. Argon2's salt is the same in every vault, so words someone picked, or typed
+/// words a checksum let through, would be open to one precomputation against every vault.
+/// They open a space as [`Words`] do.
+pub struct NewWords(Words);
+
+impl NewWords {
+    pub fn generate() -> NewWords {
         let mut words = Words { bits: Box::new([0; 16]) };
         random(&mut words.bits[..]);
-        words
+        NewWords(words)
     }
+}
 
+impl Deref for NewWords {
+    type Target = Words;
+
+    fn deref(&self) -> &Words {
+        &self.0
+    }
+}
+
+impl fmt::Debug for NewWords {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NewWords(…)")
+    }
+}
+
+impl Words {
     /// Words from their indices. `InvalidWords` if an index isn't below 2048 or the
     /// checksum fails – most likely a typo.
     pub fn from_indices(indices: [u16; 12]) -> Result<Words, Error> {
@@ -68,7 +90,7 @@ impl Words {
 }
 
 fn checksum(bits: &[u8; 16]) -> u8 {
-    Sha256::digest(bits)[0] >> 4
+    wiping_stack(|| Sha256::digest(bits)[0] >> 4)
 }
 
 impl Drop for Words {
@@ -109,7 +131,7 @@ mod tests {
     #[test]
     fn indices_round_trip() {
         for _ in 0..100 {
-            let words = Words::generate();
+            let words = NewWords::generate();
             let again = Words::from_indices(words.indices()).unwrap();
             assert_eq!(again.bits, words.bits);
         }
@@ -117,7 +139,7 @@ mod tests {
 
     #[test]
     fn checksum_catches_most_typos() {
-        let words = Words::generate();
+        let words = NewWords::generate();
         let mut caught = 0;
         let mut tried = 0;
         for position in 0..12 {
@@ -140,13 +162,15 @@ mod tests {
 
     #[test]
     fn out_of_range_index_is_invalid() {
-        let mut indices = Words::generate().indices();
+        let mut indices = NewWords::generate().indices();
         indices[5] = 2048;
         assert!(matches!(Words::from_indices(indices), Err(Error::InvalidWords)));
     }
 
     #[test]
     fn debug_hides_the_words() {
-        assert_eq!(format!("{:?}", Words::generate()), "Words(…)");
+        let words = NewWords::generate();
+        assert_eq!(format!("{words:?}"), "NewWords(…)");
+        assert_eq!(format!("{:?}", *words), "Words(…)");
     }
 }

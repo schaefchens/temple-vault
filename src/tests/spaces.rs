@@ -3,8 +3,10 @@
 use super::memory::Memory;
 use super::{SMALL_NOISE, contains, create_on, phrase, readable, superblock_bytes};
 use crate::slots::{SLOT, SLOTS};
+use crate::space::PAYLOAD_BYTES;
 use crate::vault::{Setup, Vault};
-use crate::{Error, Space, ZONE};
+use crate::{Error, Interrupt, Space, ZONE};
+use std::io::{self, Read};
 use std::sync::Arc;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -16,7 +18,7 @@ fn new_vault() -> (Arc<Memory>, Vault, Space) {
 }
 
 fn reopen(memory: &Arc<Memory>) -> Vault {
-    Vault::open_on(memory.clone(), SMALL_NOISE).unwrap()
+    Vault::open_on(memory.clone(), SMALL_NOISE, false).unwrap()
 }
 
 fn unlock(vault: &Vault, n: usize) -> Option<Space> {
@@ -383,7 +385,7 @@ fn locking_drops_what_was_left_uncommitted() {
 #[test]
 fn small_files_are_not_vaults() {
     let memory = Memory::with_bytes(vec![7; ZONE as usize]);
-    assert!(matches!(Vault::open_on(memory, SMALL_NOISE), Err(Error::NotAVault)));
+    assert!(matches!(Vault::open_on(memory, SMALL_NOISE, false), Err(Error::NotAVault)));
 }
 
 #[test]
@@ -651,4 +653,197 @@ fn every_fts5_table_forgets_deleted_text() {
         assert!(!text.contains("zebrafinchmarker"), "{create}");
         assert!(text.contains("another text"), "{create}");
     }
+}
+
+/// From this review: objects crossed the bindings in one buffer. Written in pieces of any
+/// size, they come out as one; begun in one space, they go into no other; never finished,
+/// they leave their blocks free from the next opening.
+#[test]
+fn objects_written_in_pieces_round_trip() {
+    let (_memory, vault, space) = new_vault();
+    let bytes = content(3 * PAYLOAD_BYTES + 100, 9);
+    for size in [1, 999, PAYLOAD_BYTES, PAYLOAD_BYTES + 1, bytes.len()] {
+        let mut object = space.begin_object().unwrap();
+        for piece in bytes.chunks(size) {
+            space.write_object(&mut object, piece).unwrap();
+        }
+        space.write_object(&mut object, &[]).unwrap();
+        let id = space.finish_object(object).unwrap();
+        assert_eq!(space.read_object(id, 0..bytes.len() as u64).unwrap(), bytes, "pieces of {size}");
+    }
+    let empty = space.finish_object(space.begin_object().unwrap()).unwrap();
+    assert_eq!(space.object_len(empty).unwrap(), 0);
+
+    let other_memory = Memory::new();
+    let (_other_vault, other) = create_on(&other_memory, 1, Setup::default());
+    let mut object = space.begin_object().unwrap();
+    assert!(matches!(other.write_object(&mut object, b"x"), Err(Error::Io(_))));
+    assert!(matches!(other.finish_object(object), Err(Error::Io(_))));
+    // A piece that fails ends the object and frees its blocks; another try is refused, as
+    // the piece may have been half written.
+    let free = other.store().free_blocks();
+    let mut object = other.begin_object().unwrap();
+    other.write_object(&mut object, &bytes).unwrap();
+    other_memory.fill_up();
+    assert!(
+        matches!(other.write_object(&mut object, &bytes), Err(Error::Io(e)) if e.kind() == io::ErrorKind::StorageFull)
+    );
+    assert_eq!(other.store().free_blocks(), free);
+    assert!(
+        matches!(other.write_object(&mut object, &bytes), Err(Error::Io(e)) if e.kind() == io::ErrorKind::InvalidInput)
+    );
+
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    let free = space.store().free_blocks();
+    let mut left = space.begin_object().unwrap();
+    space.write_object(&mut left, &content(1 << 20, 4)).unwrap();
+    let taken = space.store().free_blocks();
+    assert!(taken < free);
+    drop(left);
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    let free_again = space.store().free_blocks();
+    assert_eq!(free_again, free);
+}
+
+/// Content that asks for an interrupt halfway, as a lock from another thread would.
+struct Halfway {
+    left: usize,
+    interrupt: Option<Interrupt>,
+}
+
+impl Read for Halfway {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.left <= 1 << 20
+            && let Some(interrupt) = self.interrupt.take()
+        {
+            interrupt.interrupt();
+        }
+        let n = buf.len().min(self.left);
+        buf[..n].fill(7);
+        self.left -= n;
+        Ok(n)
+    }
+}
+
+/// From this review: a lock waited for the work running before it – an object of hundreds of
+/// MB, a long query – while iOS suspends an app within seconds. An interrupt stops it; work
+/// that starts afterwards runs as usual.
+#[test]
+fn an_interrupt_stops_the_work_running() {
+    let (_memory, vault, space) = new_vault();
+    let free = space.store().free_blocks();
+    let halfway = Halfway { left: 2 << 20, interrupt: Some(space.interrupt_handle()) };
+    assert!(matches!(space.put_object(halfway), Err(Error::Interrupted)));
+    assert_eq!(space.store().free_blocks(), free);
+    let id = space.put_object(&content(100_000, 2)[..]).unwrap();
+    assert_eq!(space.read_object(id, 0..100_000).unwrap(), content(100_000, 2));
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    {
+        let interrupt = space.interrupt_handle();
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            interrupt.interrupt();
+        });
+        let counted = space.db().query_row(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10000000000) SELECT count(*) FROM n",
+            [],
+            |row| row.get::<_, i64>(0),
+        );
+        stopper.join().unwrap();
+        assert!(
+            matches!(&counted, Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::OperationInterrupted),
+            "{counted:?}"
+        );
+    }
+    note(&space, "after");
+    space.lock().unwrap();
+    assert_eq!(notes(&unlock(&vault, 0).unwrap()), ["after"]);
+}
+
+/// From this review: one damaged block – the tag table's, or a page every opening reads – made
+/// a space unopenable, and nothing read what was left. Salvaged, it opens read-only and writes
+/// nothing: whole after damage to its tag table, so that a copy into a new vault keeps
+/// everything; without the damaged page's table otherwise. Page 1 – the schema – it can't spare.
+#[test]
+fn a_damaged_space_can_be_salvaged() {
+    let (memory, vault, space) = new_vault();
+    note(&space, "kept");
+    let id = space.put_object(&content(10_000, 3)[..]).unwrap();
+    space.lock().unwrap();
+    // Opening and locking with nothing changed leaves the tag table where it is.
+    let space = unlock(&vault, 0).unwrap();
+    let objects_page: i64 = space
+        .db()
+        .query_row("SELECT rootpage FROM sqlite_schema WHERE name = 'temple_objects'", [], |row| row.get(0))
+        .unwrap();
+    let (tags, objects, schema) = {
+        let store = space.store();
+        (store.tag_table_offset(), store.page_offset(objects_page as u64 - 1), store.page_offset(0))
+    };
+    space.lock().unwrap();
+    drop(vault);
+    let intact = memory.bytes();
+    let damaged = |offset: u64| {
+        let mut bytes = intact.clone();
+        bytes[offset as usize + 100] ^= 1;
+        let memory = Memory::with_bytes(bytes);
+        (memory.clone(), Vault::open_on(memory, SMALL_NOISE, false).unwrap())
+    };
+
+    let (memory, vault) = damaged(tags);
+    assert!(matches!(vault.unlock_with_key(&phrase(0).1), Err(Error::Damaged)));
+    let before = memory.bytes();
+    let salvaged = vault.salvage(&phrase(0).0).unwrap().unwrap();
+    assert!(salvaged.is_read_only());
+    assert_eq!(notes(&salvaged), ["kept"]);
+    assert_eq!(salvaged.read_object(id, 0..10_000).unwrap(), content(10_000, 3));
+    assert!(matches!(salvaged.put_object(&b"x"[..]), Err(Error::ReadOnly)));
+    let new = Memory::new();
+    let (rebuilt, ()) =
+        Vault::create_on(new, SMALL_NOISE, |file, _claim| salvaged.copy_to(file, phrase(0).1.duplicate(), true))
+            .unwrap();
+    salvaged.lock().unwrap();
+    assert!(memory.bytes() == before, "salvaging wrote to the vault");
+    let copy = unlock(&rebuilt, 0).unwrap();
+    assert_eq!(notes(&copy), ["kept"]);
+    assert_eq!(copy.read_object(id, 0..10_000).unwrap(), content(10_000, 3));
+
+    let (_memory, vault) = damaged(objects);
+    assert!(matches!(vault.unlock_with_key(&phrase(0).1), Err(Error::Damaged)));
+    let salvaged = vault.salvage(&phrase(0).0).unwrap().unwrap();
+    assert_eq!(notes(&salvaged), ["kept"]);
+    assert!(salvaged.read_object(id, 0..10).is_err());
+    salvaged.lock().unwrap();
+
+    let (_memory, vault) = damaged(schema);
+    assert!(vault.salvage(&phrase(0).0).is_err());
+    assert!(vault.salvage(&phrase(1).0).unwrap().is_none());
+}
+
+/// From the review of 2026-10-28: whatever failed beneath SQLite – a page from another moment,
+/// a full disk, a record outgrowing its superblock – reached the app as "disk I/O error".
+/// `explain` tells it apart.
+#[test]
+fn an_io_error_is_explained() {
+    let (memory, vault, space) = new_vault();
+    space.db().execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);").unwrap();
+    let page: i64 =
+        space.db().query_row("SELECT rootpage FROM sqlite_schema WHERE name = 't'", [], |row| row.get(0)).unwrap();
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    let offset = space.store().page_offset(page as u64 - 1);
+    space.lock().unwrap();
+    drop(vault);
+    let mut bytes = memory.bytes();
+    bytes[offset as usize + 100] ^= 1;
+    memory.set_bytes(bytes);
+
+    let space = unlock(&reopen(&memory), 0).unwrap();
+    let failed = space.db().query_row("SELECT x FROM t", [], |row| row.get::<_, i64>(0)).unwrap_err();
+    assert!(matches!(space.explain(failed), Error::Damaged));
+    let failed = space.db().query_row("SELECT nothing FROM t", [], |row| row.get::<_, i64>(0)).unwrap_err();
+    assert!(matches!(space.explain(failed), Error::Database(_)));
 }

@@ -15,7 +15,7 @@ use web_sys::{
 
 pub(crate) async fn create(
     name: &str,
-    words: &temple_vault::Words,
+    words: &temple_vault::NewWords,
     setup: temple_vault::Setup,
 ) -> Result<(temple_vault::Vault, temple_vault::Space), TempleError> {
     let dir = directory().await?;
@@ -31,23 +31,27 @@ pub(crate) async fn create(
     space.lock()?;
     drop(vault);
     finish(&dir, &part, name).await?;
-    let vault = open(name).await?;
+    let vault = open(name, false).await?;
     let space = vault.unlock_with_key(&key)?.ok_or_else(|| temple_vault::Error::Damaged)?;
     Ok((vault, space))
 }
 
-pub(crate) async fn open(name: &str) -> Result<temple_vault::Vault, TempleError> {
+pub(crate) async fn open(name: &str, read_only: bool) -> Result<temple_vault::Vault, TempleError> {
     let file = file(&directory().await?, name, false).await?;
-    Ok(temple_vault::Vault::open_with_handle(sync_handle(&file).await?)?)
+    Ok(temple_vault::Vault::open_with_handle(sync_handle(&file).await?, read_only)?)
 }
 
-pub(crate) async fn copy_to_new_vault(space: &Space, name: &str) -> Result<temple_vault::Vault, TempleError> {
+pub(crate) async fn copy_to_new_vault(
+    space: &Space,
+    name: &str,
+    new_words: Option<&temple_vault::NewWords>,
+) -> Result<temple_vault::Vault, TempleError> {
     let dir = directory().await?;
     let (part, handle) = start(&dir, name).await?;
     // No await while the space is held: another call on it would find it taken. A space that
     // locked meanwhile leaves the handle to close – it would keep the file from being removed.
     let copied = match space.guard().as_ref() {
-        Some(space) => space.copy_to_new_vault_with_handle(handle).map_err(TempleError::from),
+        Some(space) => space.copy_to_new_vault_with_handle(handle, new_words).map_err(TempleError::from),
         None => {
             handle.close();
             Err(locked())
@@ -61,7 +65,7 @@ pub(crate) async fn copy_to_new_vault(space: &Space, name: &str) -> Result<templ
         }
     }
     finish(&dir, &part, name).await?;
-    open(name).await
+    open(name, false).await
 }
 
 /// A fresh `.<name>.temple-part` and a handle to it, after removing what a closed tab left

@@ -1,6 +1,7 @@
 //! Fuzzing a space's superblock: its encoding, and what opening a space makes of records that
 //! pass every check a copy can be sealed with.
 
+use super::Access;
 use super::runs;
 use super::store::{File, PAYLOAD, Store, associated_data, offset_in, seal_superblock};
 use super::superblock::{self, Superblock};
@@ -62,8 +63,9 @@ pub fn space(data: &[u8]) {
         let offset = first_zone * ZONE + (copy * superblock::SIZE) as u64;
         image.write_at(&seal_superblock(&superblock_key, offset, &payload), offset).unwrap();
     }
-    let vault = Vault::open_on(image, NO_NOISE).unwrap();
-    let Ok(mut store) = Store::load(vault.file.clone(), &master, first_zone) else { return };
+    let vault = Vault::open_on(image, NO_NOISE, false).unwrap();
+    let access = if input.byte() % 4 == 0 { Access::Salvage } else { Access::Write };
+    let Ok(mut store) = Store::load(vault.file.clone(), &master, first_zone, access) else { return };
     let count = usize::from(input.byte() % 8);
     let objects = runs::decode(&input.bytes(8 * count)).unwrap_or_default();
     if store.init_free(objects).is_err() {
@@ -82,7 +84,8 @@ pub fn space(data: &[u8]) {
 
 /// The space a key block points at, opened as far as its store.
 pub(crate) fn open_store(vault: &Vault, block: &KeyBlock) {
-    let _ = Store::load(vault.file.clone(), &block.master_key, block.first_zone);
+    let _ = Store::load(vault.file.clone(), &block.master_key, block.first_zone, Access::Write);
+    let _ = Store::load(vault.file.clone(), &block.master_key, block.first_zone, Access::Salvage);
 }
 
 /// Seals a database page at every block the record gives its database, within the file, and

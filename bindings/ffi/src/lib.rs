@@ -5,9 +5,9 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use zeroize::Zeroizing;
 use temple_vault::rusqlite::types::{ToSqlOutput, ValueRef};
 use temple_vault::rusqlite::{self, Connection, ToSql, params_from_iter};
+use zeroize::Zeroizing;
 
 mod background;
 #[cfg(target_arch = "wasm32")]
@@ -34,6 +34,10 @@ pub enum TempleError {
     SpaceOpen(String),
     WordsInUse(String),
     NoSuchObject(String),
+    /// The vault was opened read-only, or the space salvaged.
+    ReadOnly(String),
+    /// Stopped by a lock that didn't wait for it.
+    Interrupted(String),
     /// The space has locked; its words open it again.
     Locked(String),
     NotFound(String),
@@ -57,6 +61,8 @@ impl fmt::Display for TempleError {
         | SpaceOpen(message)
         | WordsInUse(message)
         | NoSuchObject(message)
+        | ReadOnly(message)
+        | Interrupted(message)
         | Locked(message)
         | NotFound(message)
         | AlreadyExists(message)
@@ -82,7 +88,13 @@ impl From<temple_vault::Error> for TempleError {
             temple_vault::Error::SpaceOpen => TempleError::SpaceOpen(message),
             temple_vault::Error::WordsInUse => TempleError::WordsInUse(message),
             temple_vault::Error::NoSuchObject => TempleError::NoSuchObject(message),
-            temple_vault::Error::Database(_) => TempleError::Database(message),
+            temple_vault::Error::ReadOnly => TempleError::ReadOnly(message),
+            temple_vault::Error::Interrupted => TempleError::Interrupted(message),
+            temple_vault::Error::Database(e) => match e.sqlite_error_code() {
+                Some(rusqlite::ErrorCode::OperationInterrupted) => TempleError::Interrupted(message),
+                Some(rusqlite::ErrorCode::ReadOnly) => TempleError::ReadOnly(message),
+                _ => TempleError::Database(message),
+            },
             temple_vault::Error::Io(e) => match e.kind() {
                 std::io::ErrorKind::NotFound => TempleError::NotFound(message),
                 std::io::ErrorKind::AlreadyExists => TempleError::AlreadyExists(message),
@@ -143,11 +155,24 @@ pub struct Created {
     pub space: Arc<Space>,
 }
 
-/// 12 fresh words, as indices into a list of 2048. Only the indices count: every phrase
-/// works with every wordlist, and the app brings the list.
+/// 12 fresh words – the only words a new space or a word change takes: the same salt in every
+/// vault leaves words someone picked open to one precomputation against all of them.
 #[uniffi::export]
-pub fn generate_words() -> Vec<u16> {
-    temple_vault::Words::generate().indices().to_vec()
+pub fn generate_words() -> Arc<NewWords> {
+    Arc::new(NewWords(temple_vault::NewWords::generate()))
+}
+
+/// Fresh words from [`generate_words`]. They stay in Rust; the app shows their indices.
+#[derive(uniffi::Object)]
+pub struct NewWords(temple_vault::NewWords);
+
+#[uniffi::export]
+impl NewWords {
+    /// The 12 indices into a list of 2048. Only the indices count: every phrase works with
+    /// every wordlist, and the app brings the list.
+    pub fn indices(&self) -> Vec<u16> {
+        self.0.indices().to_vec()
+    }
 }
 
 /// Whether 12 indices are words: each below 2048, and the checksum right.
@@ -161,24 +186,43 @@ pub fn words_are_valid(words: Vec<u16>) -> bool {
 /// file path, on the web a file name in the origin private file system. Fails if something
 /// is there.
 #[uniffi::export]
-pub async fn create_vault(path: String, words: Vec<u16>, room: u64) -> Result<Created, TempleError> {
-    let words = to_words(words)?;
+pub async fn create_vault(path: String, words: Arc<NewWords>, room: u64) -> Result<Created, TempleError> {
     let setup = temple_vault::Setup { room };
     #[cfg(not(target_arch = "wasm32"))]
-    let (vault, space) = background::run(move || Ok(temple_vault::Vault::create(&path, &words, setup)?)).await?;
+    let (vault, space) = background::run(move || Ok(temple_vault::Vault::create(&path, &words.0, setup)?)).await?;
     #[cfg(target_arch = "wasm32")]
-    let (vault, space) = web::create(&path, &words, setup).await?;
+    let (vault, space) = web::create(&path, &words.0, setup).await?;
     Ok(Created { vault: Arc::new(Vault(vault)), space: Space::new(space) })
 }
 
-/// Opens the vault at `path`, named as for [`create_vault`].
+/// Opens the vault at `path`, named as for [`create_vault`]. Read-only, nothing is written to
+/// it: its spaces open read-only, and leave no trace – for a vault on read-only storage, or to
+/// look without one.
 #[uniffi::export]
-pub async fn open_vault(path: String) -> Result<Arc<Vault>, TempleError> {
+pub async fn open_vault(path: String, read_only: bool) -> Result<Arc<Vault>, TempleError> {
     #[cfg(not(target_arch = "wasm32"))]
-    let vault = background::run(move || Ok(temple_vault::Vault::open(&path)?)).await?;
+    let vault = background::run(move || match read_only {
+        true => Ok(temple_vault::Vault::open_read_only(&path)?),
+        false => Ok(temple_vault::Vault::open(&path)?),
+    })
+    .await?;
     #[cfg(target_arch = "wasm32")]
-    let vault = web::open(&path).await?;
+    let vault = web::open(&path, read_only).await?;
     Ok(Arc::new(Vault(vault)))
+}
+
+/// Marks the file at `path` to be left out of backups – on iOS, iCloud's and the computer's;
+/// every backup would be another copy of the vault. Whether the system keeps such a mark: on
+/// Android, the app's manifest leaves files out, and the web's private files aren't backed up.
+#[uniffi::export]
+pub async fn exclude_from_backup(path: String) -> Result<bool, TempleError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return background::run(move || Ok(temple_vault::Vault::exclude_from_backup(&path)?)).await;
+    #[cfg(target_arch = "wasm32")]
+    return {
+        let _ = path;
+        Ok(false)
+    };
 }
 
 /// A vault: one file holding any number of spaces, each opened by its own 12 words. Its file
@@ -202,11 +246,18 @@ impl Vault {
         Ok(space.map(Space::new))
     }
 
-    /// A new space for words that open none, which comes back open. Only after the app
-    /// confirmed with the user, so that a typo leaves no trace.
-    pub async fn create_space(self: Arc<Self>, words: Vec<u16>, room: u64) -> Result<Arc<Space>, TempleError> {
+    /// What can still be read of a damaged space, read-only – its blocks checked, its tag table
+    /// not: to copy into a new vault, or out. Writes nothing to the vault.
+    pub async fn salvage(self: Arc<Self>, words: Vec<u16>) -> Result<Option<Arc<Space>>, TempleError> {
         let words = to_words(words)?;
-        let space = background::run(move || Ok(self.0.create_space(&words, temple_vault::Setup { room })?)).await?;
+        let space = background::run(move || Ok(self.0.salvage(&words)?)).await?;
+        Ok(space.map(Space::new))
+    }
+
+    /// A new space under fresh words, which comes back open – for words that opened none, once
+    /// the app confirmed with the user, so that a typo leaves no trace.
+    pub async fn create_space(self: Arc<Self>, words: Arc<NewWords>, room: u64) -> Result<Arc<Space>, TempleError> {
+        let space = background::run(move || Ok(self.0.create_space(&words.0, temple_vault::Setup { room })?)).await?;
         Ok(Space::new(space))
     }
 }
@@ -214,17 +265,22 @@ impl Vault {
 /// An open space: what one set of 12 words opens. Lock it when done – one the app merely
 /// lets go of locks when the garbage collector gets to it, and keeps its vault busy until then.
 #[derive(uniffi::Object)]
-pub struct Space(Mutex<Option<temple_vault::Space>>);
+pub struct Space {
+    space: Mutex<Option<temple_vault::Space>>,
+    /// Stops the work running, for a lock.
+    interrupt: temple_vault::Interrupt,
+}
 
 impl Space {
     fn new(space: temple_vault::Space) -> Arc<Space> {
-        Arc::new(Space(Mutex::new(Some(space))))
+        let interrupt = space.interrupt_handle();
+        Arc::new(Space { space: Mutex::new(Some(space)), interrupt })
     }
 
     /// The space, or nothing once it has locked. A panic while it was held changes nothing
     /// Temple relies on: it checks what it reads.
     pub(crate) fn guard(&self) -> MutexGuard<'_, Option<temple_vault::Space>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.space.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Runs `work` on the open space, off the JS thread.
@@ -254,10 +310,18 @@ impl Space {
         self.with(move |space| checked(space, query(space.db(), &sql, &params))).await
     }
 
-    /// Stores `content` as a new object – audio, a document – and returns its id. Not inside
-    /// a transaction.
+    /// Stores `content` as a new object – audio, a document – and returns its id; inside a
+    /// transaction, it commits or rolls back with it.
     pub async fn put_object(self: Arc<Self>, content: Vec<u8>) -> Result<i64, TempleError> {
+        let content = Zeroizing::new(content);
         self.with(move |space| Ok(space.put_object(content.as_slice())?)).await
+    }
+
+    /// A new object written piece by piece – content too large for one buffer, such as a
+    /// download – stored once finished.
+    pub async fn begin_object(self: Arc<Self>) -> Result<Arc<ObjectWriter>, TempleError> {
+        let writer = self.clone().with(|space| Ok(space.begin_object()?)).await?;
+        Ok(Arc::new(ObjectWriter { space: self, writer: Mutex::new(Some(writer)) }))
     }
 
     /// The bytes of an object from `start` up to `end`, or up to its end if that's further.
@@ -286,12 +350,16 @@ impl Space {
         self.with(|space| Ok(space.changed_elsewhere())).await
     }
 
+    /// Whether the space is read-only: in a vault opened read-only, or salvaged.
+    pub async fn is_read_only(self: Arc<Self>) -> Result<bool, TempleError> {
+        self.with(|space| Ok(space.is_read_only())).await
+    }
+
     /// New words for this space; a phrase key kept for quick unlock stops working. Interrupted,
     /// both words open the space until the change is made again from the old ones, or the
     /// old ones are forgotten from the new.
-    pub async fn change_words(self: Arc<Self>, words: Vec<u16>) -> Result<(), TempleError> {
-        let words = to_words(words)?;
-        self.with(move |space| Ok(space.change_words(&words)?)).await
+    pub async fn change_words(self: Arc<Self>, words: Arc<NewWords>) -> Result<(), TempleError> {
+        self.with(move |space| Ok(space.change_words(&words.0)?)).await
     }
 
     /// Words that open this space no more; whether they did. Not the words it was opened with.
@@ -305,26 +373,40 @@ impl Space {
         self.with(|space| Ok(space.keep_only_this()?)).await
     }
 
-    /// A new vault at `path`, named as for [`create_vault`], holding a copy of this space
-    /// under the same words: the first step of rebuilding a vault.
-    pub async fn copy_to_new_vault(self: Arc<Self>, path: String) -> Result<Arc<Vault>, TempleError> {
+    /// A new vault at `path`, named as for [`create_vault`], holding a copy of this space: the
+    /// first step of rebuilding a vault. Under the same words – or under `new_words` after
+    /// words leaked: the copy opens only with those, under a fresh master key.
+    pub async fn copy_to_new_vault(
+        self: Arc<Self>,
+        path: String,
+        new_words: Option<Arc<NewWords>>,
+    ) -> Result<Arc<Vault>, TempleError> {
         #[cfg(not(target_arch = "wasm32"))]
-        let vault = self.with(move |space| Ok(space.copy_to_new_vault(&path)?)).await?;
+        let vault = self
+            .with(move |space| Ok(space.copy_to_new_vault(&path, new_words.as_ref().map(|words| &words.0))?))
+            .await?;
         #[cfg(target_arch = "wasm32")]
-        let vault = web::copy_to_new_vault(&self, &path).await?;
+        let vault = web::copy_to_new_vault(&self, &path, new_words.as_ref().map(|words| &words.0)).await?;
         Ok(Arc::new(Vault(vault)))
     }
 
-    /// Copies this space into another vault under the same words: the next steps of
-    /// rebuilding a vault, with hidden spaces.
-    pub async fn copy_into(self: Arc<Self>, vault: Arc<Vault>) -> Result<(), TempleError> {
-        self.with(move |space| Ok(space.copy_into(&vault.0)?)).await
+    /// Copies this space into another vault, under the same words or `new_words`: the next
+    /// steps of rebuilding a vault, with hidden spaces.
+    pub async fn copy_into(
+        self: Arc<Self>,
+        vault: Arc<Vault>,
+        new_words: Option<Arc<NewWords>>,
+    ) -> Result<(), TempleError> {
+        self.with(move |space| Ok(space.copy_into(&vault.0, new_words.as_ref().map(|words| &words.0))?)).await
     }
 
     /// Locks the space: deleted values become unreadable, keys and everything decrypted are
-    /// wiped. Nothing happens if it has locked already.
+    /// wiped. Without waiting: work running on the space stops, failing as `Interrupted`, and
+    /// the lock goes before every call still waiting – on iOS with time to finish once the app
+    /// moves to the background. Nothing happens if it has locked already.
     pub async fn lock(self: Arc<Self>) -> Result<(), TempleError> {
-        background::run(move || match self.guard().take() {
+        self.interrupt.interrupt();
+        background::run_first(move || match self.guard().take() {
             Some(space) => Ok(space.lock()?),
             None => Ok(()),
         })
@@ -335,6 +417,50 @@ impl Space {
     pub async fn is_locked(self: Arc<Self>) -> Result<bool, TempleError> {
         background::run(move || Ok(self.guard().is_none())).await
     }
+}
+
+/// An object written piece by piece, from [`Space::begin_object`]. One never finished leaves
+/// nothing behind once its space opens again.
+#[derive(uniffi::Object)]
+pub struct ObjectWriter {
+    space: Arc<Space>,
+    writer: Mutex<Option<temple_vault::ObjectWriter>>,
+}
+
+#[uniffi::export]
+impl ObjectWriter {
+    /// Adds the next piece. A piece that fails ends the object: begin it again.
+    pub async fn write(self: Arc<Self>, bytes: Vec<u8>) -> Result<(), TempleError> {
+        let bytes = Zeroizing::new(bytes);
+        self.space
+            .clone()
+            .with(move |space| {
+                let mut writer = self.writer();
+                Ok(space.write_object(writer.as_mut().ok_or_else(finished)?, &bytes)?)
+            })
+            .await
+    }
+
+    /// Stores the object; returns its id. Inside a transaction, it commits or rolls back with it.
+    pub async fn finish(self: Arc<Self>) -> Result<i64, TempleError> {
+        self.space
+            .clone()
+            .with(move |space| {
+                let writer = self.writer().take().ok_or_else(finished)?;
+                Ok(space.finish_object(writer)?)
+            })
+            .await
+    }
+}
+
+impl ObjectWriter {
+    fn writer(&self) -> MutexGuard<'_, Option<temple_vault::ObjectWriter>> {
+        self.writer.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn finished() -> TempleError {
+    TempleError::NoSuchObject("the object is finished".into())
 }
 
 /// Words from the app's indices, which are wiped once read.
@@ -356,12 +482,10 @@ pub(crate) fn locked() -> TempleError {
     TempleError::Locked("the space has locked".into())
 }
 
-/// SQLite's result, its errors told apart when another device has opened the vault.
+/// SQLite's result, its I/O errors told apart: another device opened the vault, a page failed
+/// its check, the disk is full.
 fn checked<T>(space: &temple_vault::Space, result: rusqlite::Result<T>) -> Result<T, TempleError> {
-    result.map_err(|e| match space.changed_elsewhere() {
-        true => temple_vault::Error::ChangedElsewhere.into(),
-        false => temple_vault::Error::Database(e).into(),
-    })
+    result.map_err(|e| space.explain(e).into())
 }
 
 fn query(db: &Connection, sql: &str, params: &[Value]) -> rusqlite::Result<Rows> {

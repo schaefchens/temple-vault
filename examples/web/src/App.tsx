@@ -3,7 +3,7 @@
 // Hiding the page locks the space. `?self-test` runs Temple's self-test here instead.
 
 import { TempleProvider, useExecute, useQuery, useVault, type VaultHandle } from '@schaefchens/temple-react';
-import { TempleError, temple, type Space } from '@schaefchens/temple-web';
+import { TempleError, temple, type NewWords, type Space } from '@schaefchens/temple-web';
 import { selfTest, type Check } from '@schaefchens/temple/self-test';
 import { english, toIndices, toWords } from '@schaefchens/temple/words';
 import { useEffect, useState, type FormEvent } from 'react';
@@ -39,7 +39,7 @@ function Demo() {
         </p>
       )}
       {vault.status === 'missing' && (
-        <NewWords
+        <FreshWords
           title="A new vault"
           action="Create vault"
           busy="Creating the vault – writing its noise…"
@@ -58,14 +58,14 @@ function Demo() {
 }
 
 /** Fresh words to write down, and what they're for. */
-function NewWords(props: {
+function FreshWords(props: {
   title: string;
   action: string;
   busy: string;
-  onConfirm(words: number[]): Promise<void>;
+  onConfirm(words: NewWords): Promise<void>;
   onCancel?(): void;
 }) {
-  const [words, setWords] = useState<number[] | null>(null);
+  const [words, setWords] = useState<NewWords | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => void temple.generateWords().then(setWords), []);
@@ -75,7 +75,7 @@ function NewWords(props: {
       <h1>{props.title}</h1>
       <p>Write these 12 words down. They are the only way in: nobody can recover them.</p>
       <p data-testid="words" className="words">
-        {words ? toWords(words, english).join(' ') : '…'}
+        {words ? toWords(words.indices, english).join(' ') : '…'}
       </p>
       <div className="row">
         <button
@@ -107,7 +107,7 @@ function Unlock({ vault }: { vault: VaultHandle }) {
 
   if (newSpace) {
     return (
-      <NewWords
+      <FreshWords
         title="A new space"
         action="Create space"
         busy="Creating the space…"
@@ -194,7 +194,7 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
 
   if (mode === 'change-words') {
     return (
-      <NewWords
+      <FreshWords
         title="New words for this space"
         action="Use these words"
         busy="Changing the words…"
@@ -257,13 +257,18 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
             const file = event.target.files?.[0];
             event.target.value = '';
             if (!file) return;
-            run(async () => {
-              const bytes = new Uint8Array(await file.arrayBuffer());
-              await transaction(space, async () => {
-                const object = await space.putObject(bytes);
+            // In pieces as the browser reads them, so that a large file never sits in memory whole.
+            run(() =>
+              transaction(space, async () => {
+                const writer = await space.writeObject();
+                const pieces = file.stream().getReader();
+                for (let piece = await pieces.read(); !piece.done; piece = await pieces.read()) {
+                  await writer.write(piece.value);
+                }
+                const object = await writer.finish();
                 await execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, file.name, file.size]);
-              });
-            });
+              }),
+            );
           }}
         />
       </label>
@@ -336,14 +341,14 @@ function SelfTestRun() {
   return (
     <main>
       <h1>Self-test</h1>
+      <h2 data-testid="self-test-result">
+        {!done ? 'Running…' : failed ? `${failed} of ${checks.length} checks failed` : `All ${checks.length} checks passed`}
+      </h2>
       {checks.map((check) => (
         <div key={check.name} className={`check ${check.ok ? 'passed' : 'error'}`}>
           {check.ok ? '✓' : '✗'} {check.name} · {check.seconds.toFixed(1)} s{check.message ? `\n${check.message}` : ''}
         </div>
       ))}
-      <h2 data-testid="self-test-result">
-        {!done ? 'Running…' : failed ? `${failed} of ${checks.length} checks failed` : `All ${checks.length} checks passed`}
-      </h2>
     </main>
   );
 }

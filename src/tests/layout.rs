@@ -25,8 +25,8 @@ fn fill(space: &Space, megabytes: usize) {
 #[test]
 fn a_vault_is_laid_out_as_the_noise_simulation_assumes() {
     let memory = Memory::new();
-    let (vault, everyday) = Vault::create_on(memory.clone(), COUNTED, |file| {
-        Space::create(file, file.claim(), phrase(0).1.duplicate(), Setup::default(), true)
+    let (vault, everyday) = Vault::create_on(memory.clone(), COUNTED, |file, claim| {
+        Space::create(file, Some(claim), phrase(0).1.duplicate(), Setup::default(), true)
     })
     .unwrap();
     assert_eq!(zones(&memory), 2 + 16 + 7);

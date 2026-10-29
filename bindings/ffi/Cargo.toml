@@ -17,6 +17,12 @@ zeroize = "1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 futures-channel = "0.3"
 
+# On iOS: background time for a lock, so that the app isn't suspended halfway.
+[target.'cfg(target_os = "ios")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSProcessInfo", "NSString", "block2"] }
+
 # On the web: the module runs in a worker, its vaults in the origin private file system.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"

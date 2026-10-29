@@ -49,7 +49,7 @@ pub fn slot_table(data: &[u8]) {
         };
         image.write_at(&sealed, slots::offset(slot)).unwrap();
     }
-    let vault = Vault::open_on(image, NO_NOISE).unwrap();
+    let vault = Vault::open_on(image, NO_NOISE, false).unwrap();
     let found = vault.file.find_key_block(&wrapping, key.slots()).unwrap();
     assert_eq!(found.as_ref().map(|block| block.generation), highest);
     if let Some(block) = found {

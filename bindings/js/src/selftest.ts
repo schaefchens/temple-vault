@@ -1,7 +1,7 @@
 // Temple's API on this platform, end to end: what every binding must do alike, in a real
 // app on a real device or browser. Both demos run it; so can any app.
 
-import { TempleError, type ErrorKind, type Space, type Temple, type Vault } from './api';
+import { TempleError, type ErrorKind, type NewWords, type Space, type Temple, type Vault } from './api';
 
 export type Check = { name: string; ok: boolean; message?: string; seconds: number };
 
@@ -37,11 +37,13 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
   let vault!: Vault;
   let space!: Space;
   let copy: Vault | null = null;
+  let firstWords!: NewWords;
   let first!: number[];
   let second!: number[];
 
   await check('words: 12 indices below 2048 with their checksum', async () => {
-    first = await temple.generateWords();
+    firstWords = await temple.generateWords();
+    first = firstWords.indices;
     assert(first.length === 12 && first.every((i) => Number.isInteger(i) && i >= 0 && i < 2048), `got ${first}`);
     assert(await temple.wordsAreValid(first), 'fresh words are valid');
     assert(!(await temple.wordsAreValid(first.slice(0, 11))), '11 words are not');
@@ -50,9 +52,16 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     assert(!(await temple.wordsAreValid([...first.slice(0, 11), first[11] ^ 1])), 'a wrong checksum is not');
   });
 
+  await check('typed words never become a vault or a space', async () => {
+    const typed = { indices: first } as NewWords;
+    await expectError(() => temple.createVault(a, typed), 'InvalidWords');
+  });
+
   await check('a new vault, its first space open', async () => {
-    ({ vault, space } = await temple.createVault(a, first));
+    ({ vault, space } = await temple.createVault(a, firstWords));
     assert(!(await space.isLocked()), 'the space is open');
+    assert(!(await space.isReadOnly()), 'and writable');
+    assert(typeof (await temple.excludeFromBackup(a)) === 'boolean', 'its file can be left out of backups');
   });
 
   await check('SQL: every kind of value comes back as it went in', async () => {
@@ -107,6 +116,16 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     await expectError(() => space.objectLength(dropped), 'NoSuchObject');
   });
 
+  await check('objects written in pieces come out whole', async () => {
+    const bytes = pattern(300_000);
+    const writer = await space.writeObject();
+    for (let at = 0; at < bytes.length; at += 70_001) await writer.write(bytes.subarray(at, at + 70_001));
+    const id = await writer.finish();
+    assert(equal(await space.readObject(id), bytes), 'the same bytes');
+    await expectError(() => writer.finish(), 'NoSuchObject');
+    await space.deleteObject(id);
+  });
+
   await check('a locked space refuses every call', async () => {
     await space.lock();
     assert(await space.isLocked(), 'it says so');
@@ -115,7 +134,7 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
   });
 
   await check('its words open the space again; other words open none', async () => {
-    assert((await vault.unlock(await temple.generateWords())) === null, 'unknown words open nothing');
+    assert((await vault.unlock((await temple.generateWords()).indices)) === null, 'unknown words open nothing');
     space = await opened(vault.unlock(first));
     const notes = await space.query('SELECT body FROM note');
     assert(notes.length === 1 && notes[0].body === 'written before locking', 'the note is back');
@@ -139,13 +158,15 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
 
   await check('a second space under other words sees nothing of the first', async () => {
     await space.lock();
-    second = await temple.generateWords();
-    const hidden = await vault.createSpace(second);
+    const secondWords = await temple.generateWords();
+    second = secondWords.indices;
+    await expectError(() => vault.createSpace({ indices: second } as NewWords), 'InvalidWords');
+    const hidden = await vault.createSpace(secondWords);
     const tables = await hidden.query("SELECT name FROM sqlite_master WHERE name = 'note'");
     assert(tables.length === 0, "the first space's table isn't there");
     await hidden.executeBatch("CREATE TABLE secret (body TEXT); INSERT INTO secret VALUES ('hidden')");
     await hidden.lock();
-    await expectError(() => vault.createSpace(first), 'WordsInUse');
+    await expectError(() => vault.createSpace(firstWords), 'WordsInUse');
     space = await opened(vault.unlock(first));
     const secret = await space.query("SELECT name FROM sqlite_master WHERE name = 'secret'");
     assert(secret.length === 0, "the second space's table isn't there either");
@@ -154,12 +175,13 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
   await check('changed words: the old words and the old key open nothing', async () => {
     const key = await space.phraseKey();
     const changed = await temple.generateWords();
+    await expectError(() => space.changeWords({ indices: changed.indices } as NewWords), 'InvalidWords');
     await space.changeWords(changed);
     await space.lock();
     assert((await vault.unlock(first)) === null, 'the old words');
     assert((await vault.unlockWithKey(key)) === null, 'the old key');
     const old = first;
-    first = changed;
+    first = changed.indices;
     space = await opened(vault.unlock(first));
     assert(!(await space.forgetWords(old)), 'nothing left of the old words to forget');
     await expectError(() => space.forgetWords(first), 'WordsInUse');
@@ -173,15 +195,39 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     assert((await space.query('SELECT body FROM note')).length === 1, 'the note');
   });
 
-  await check('a missing vault is "NotFound"; a taken path "AlreadyExists"', async () => {
-    await expectError(() => temple.openVault(files.path(`self-test-${tag}-missing.vault`)), 'NotFound');
-    await expectError(() => temple.createVault(a, second), 'AlreadyExists');
+  await check('a vault opened read-only: its spaces read, refuse writes, and salvage reads too', async () => {
+    await space.lock();
+    vault.close();
+    vault = await temple.openVault(a, { readOnly: true });
+    space = await opened(vault.unlock(first));
+    assert(await space.isReadOnly(), 'the space is read-only');
+    assert((await space.query('SELECT body FROM note')).length === 1, 'the note');
+    await expectError(() => space.execute('INSERT INTO note (body) VALUES (?)', ['refused']), 'ReadOnly');
+    await expectError(() => space.putObject(new Uint8Array(1)), 'ReadOnly');
+    await expectError(async () => vault.createSpace(await temple.generateWords()), 'ReadOnly');
+    await space.lock();
+    vault.close();
+    vault = await temple.openVault(a);
+    space = await opened(vault.salvage(first));
+    assert(await space.isReadOnly(), 'a salvaged space is read-only');
+    assert((await space.query('SELECT body FROM note')).length === 1, 'the note, salvaged');
+    await space.lock();
+    space = await opened(vault.unlock(first));
   });
 
-  await check('rebuilding: a copy into a new vault, then the second space into it', async () => {
-    copy = await space.copyToNewVault(b);
+  await check('a missing vault is "NotFound"; a taken path "AlreadyExists"', async () => {
+    await expectError(() => temple.openVault(files.path(`self-test-${tag}-missing.vault`)), 'NotFound');
+    await expectError(async () => temple.createVault(a, await temple.generateWords()), 'AlreadyExists');
+  });
+
+  let rebuilt!: number[];
+  await check('rebuilding under new words: a copy into a new vault, then the second space into it', async () => {
+    const words = await temple.generateWords();
+    rebuilt = words.indices;
+    copy = await space.copyToNewVault(b, { words });
     await space.lock();
-    const copied = await opened(copy.unlock(first));
+    assert((await copy.unlock(first)) === null, 'the old words open nothing in the copy');
+    const copied = await opened(copy.unlock(rebuilt));
     assert((await copied.query('SELECT body FROM note')).length === 1, 'the note in the copy');
     await copied.lock();
     const hidden = await opened(vault.unlock(second));
@@ -194,7 +240,7 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
 
   await check('keeping only one space removes the others', async () => {
     assert(copy, 'the copy exists');
-    const kept = await opened(copy.unlock(first));
+    const kept = await opened(copy.unlock(rebuilt));
     await kept.keepOnlyThis();
     await kept.lock();
     assert((await copy.unlock(second)) === null, 'the second space is gone');
@@ -202,17 +248,24 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     copy = null;
   });
 
-  await check('a vault opened twice: refused while open, or the first stops once a space opens in the second', async () => {
+  await check('a vault opened twice: refused while a space is open, or the first stops once a space opens in the second', async () => {
     space = await opened(vault.unlock(first));
     let other: Vault;
     try {
+      // The web refuses a file open elsewhere; iOS and Android, a space while one is open.
       other = await temple.openVault(a);
     } catch (error) {
       if (TempleError.is(error, 'InUse')) return;
       throw error;
     }
     try {
-      const there = await opened(other.unlock(first));
+      let there: Space;
+      try {
+        there = await opened(other.unlock(first));
+      } catch (error) {
+        if (TempleError.is(error, 'InUse')) return;
+        throw error;
+      }
       await expectError(() => space.execute('INSERT INTO note (body) VALUES (?)', ['after']), 'ChangedElsewhere');
       assert(await space.changedElsewhere(), 'the space knows');
       await space.lock().catch(() => {});

@@ -4,7 +4,7 @@
 // Temple's self-test on this device instead.
 
 import { TempleProvider, useExecute, useQuery, useVault, type VaultHandle } from '@schaefchens/temple-react';
-import { TempleError, temple, type Space } from '@schaefchens/temple-react-native';
+import { TempleError, temple, type NewWords, type Space } from '@schaefchens/temple-react-native';
 import { selfTest, type Check } from '@schaefchens/temple/self-test';
 import { english, toIndices, toWords } from '@schaefchens/temple/words';
 import { File, Paths } from 'expo-file-system';
@@ -63,11 +63,15 @@ function Demo() {
       return <Text style={styles.error}>{message(vault.error)}</Text>;
     case 'missing':
       return (
-        <NewWords
+        <FreshWords
           title="A new vault"
           action="Create vault"
           busy="Creating the vault – writing its noise…"
-          onConfirm={(words) => vault.create(words)}
+          onConfirm={async (words) => {
+            await vault.create(words);
+            // Every backup would be another copy of the vault.
+            await temple.excludeFromBackup(VAULT);
+          }}
         />
       );
     case 'locked':
@@ -78,14 +82,14 @@ function Demo() {
 }
 
 /** Fresh words to write down, and what they're for. */
-function NewWords(props: {
+function FreshWords(props: {
   title: string;
   action: string;
   busy: string;
-  onConfirm(words: number[]): Promise<void>;
+  onConfirm(words: NewWords): Promise<void>;
   onCancel?(): void;
 }) {
-  const [words, setWords] = useState<number[] | null>(null);
+  const [words, setWords] = useState<NewWords | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => void temple.generateWords().then(setWords), []);
@@ -95,7 +99,7 @@ function NewWords(props: {
       <Text style={styles.title}>{props.title}</Text>
       <Text>Write these 12 words down. They are the only way in: nobody can recover them.</Text>
       <Text testID="words" selectable style={styles.words}>
-        {words ? toWords(words, english).join(' ') : '…'}
+        {words ? toWords(words.indices, english).join(' ') : '…'}
       </Text>
       <Button
         label={props.action}
@@ -126,7 +130,7 @@ function Unlock({ vault }: { vault: VaultHandle }) {
 
   if (newSpace) {
     return (
-      <NewWords
+      <FreshWords
         title="A new space"
         action="Create space"
         busy="Creating the space…"
@@ -225,7 +229,7 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
 
   if (mode === 'change-words') {
     return (
-      <NewWords
+      <FreshWords
         title="New words for this space"
         action="Use these words"
         busy="Changing the words…"
@@ -278,8 +282,11 @@ function Notes({ space, lock }: { space: Space; lock(): Promise<void> }) {
         onPress={() =>
           run(() =>
             transaction(space, async () => {
+              // In pieces, as a download arrives: a large file never sits in memory whole.
               const bytes = sample(256 * 1024);
-              const object = await space.putObject(bytes);
+              const writer = await space.writeObject();
+              for (let at = 0; at < bytes.length; at += 64 * 1024) await writer.write(bytes.subarray(at, at + 64 * 1024));
+              const object = await writer.finish();
               await execute('INSERT INTO file (object, name, size) VALUES (?, ?, ?)', [object, `sample-${object}.bin`, bytes.length]);
             }),
           )
@@ -369,14 +376,15 @@ function SelfTestRun() {
   return (
     <ScrollView contentContainerStyle={styles.card}>
       <Text style={styles.title}>Self-test</Text>
+      {/* Above the checks, so that it stays on screen however many there are. */}
+      <Text testID="self-test-result" style={styles.subtitle}>
+        {!done ? 'Running…' : failed ? `${failed} of ${checks.length} checks failed` : `All ${checks.length} checks passed`}
+      </Text>
       {checks.map((check) => (
         <Text key={check.name} style={check.ok ? styles.passed : styles.error}>
           {check.ok ? '✓' : '✗'} {check.name} · {check.seconds.toFixed(1)} s{check.message ? `\n${check.message}` : ''}
         </Text>
       ))}
-      <Text testID="self-test-result" style={styles.subtitle}>
-        {!done ? 'Running…' : failed ? `${failed} of ${checks.length} checks failed` : `All ${checks.length} checks passed`}
-      </Text>
     </ScrollView>
   );
 }

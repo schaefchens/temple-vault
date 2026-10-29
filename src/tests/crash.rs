@@ -204,7 +204,7 @@ fn state(space: &Space) -> Result<State, String> {
 
 /// Opens the vault an image holds and the space `key` opens there.
 fn open(image: Vec<u8>, key: &PhraseKey) -> Result<Option<Space>, String> {
-    let vault = Vault::open_on(Memory::with_bytes(image), SMALL_NOISE).map_err(|e| format!("vault: {e}"))?;
+    let vault = Vault::open_on(Memory::with_bytes(image), SMALL_NOISE, false).map_err(|e| format!("vault: {e}"))?;
     vault.unlock_with_key(key).map_err(|e| format!("space: {e}"))
 }
 
@@ -278,7 +278,7 @@ fn a_space_goes_on_after_a_crash() {
     let mut rng = Rng(2);
     for _ in 0..20 {
         let at = ends[rng.below(ends.len())];
-        let vault = Vault::open_on(Memory::with_bytes(recording.crash(at, &mut rng)), SMALL_NOISE).unwrap();
+        let vault = Vault::open_on(Memory::with_bytes(recording.crash(at, &mut rng)), SMALL_NOISE, false).unwrap();
         let space = vault.unlock_with_key(&phrase(0).1).unwrap().unwrap();
         let recovered = state(&space).unwrap();
         let mut work = Workload { rng: Rng(rng.next()), next: 1000, state: recovered };
@@ -645,7 +645,7 @@ fn a_crash_while_a_shrinking_database_locks_leaves_nothing_deleted() {
     let mut rng = Rng(51);
     for at in 0..=recording.events.len() {
         let image = Memory::with_bytes(recording.crash(at, &mut rng));
-        let vault = Vault::open_on(image.clone(), SMALL_NOISE).unwrap();
+        let vault = Vault::open_on(image.clone(), SMALL_NOISE, false).unwrap();
         let space = vault.unlock_with_key(&phrase(0).1).unwrap().expect("the space");
         assert_eq!(state(&space), Ok(State::new()), "crash at {at}");
         space.lock().unwrap();
@@ -716,7 +716,7 @@ fn an_interrupted_word_change_can_be_finished() {
     let new_blocks_durable = recording.events.iter().position(|event| matches!(event, Event::Sync)).unwrap() + 1;
     let crashed = || {
         let image = recording.crash(new_blocks_durable, &mut Rng(1));
-        Vault::open_on(Memory::with_bytes(image), SMALL_NOISE).unwrap()
+        Vault::open_on(Memory::with_bytes(image), SMALL_NOISE, false).unwrap()
     };
     let opens = |vault: &Vault, n: usize| vault.unlock_with_key(&phrase(n).1).unwrap().is_some();
 

@@ -18,6 +18,13 @@ impl Key {
         Key(Box::new([0; 32]))
     }
 
+    /// A key `fill` writes where it stays.
+    pub(crate) fn filled(fill: impl FnOnce(&mut [u8; 32])) -> Key {
+        let mut key = Key::zeros();
+        fill(&mut key.0);
+        key
+    }
+
     pub(crate) fn random() -> Key {
         let mut key = Key::zeros();
         random(&mut key.0[..]);
@@ -40,7 +47,8 @@ impl Key {
 
     /// HKDF-SHA256 without salt, from this key to `out`.
     pub(crate) fn expand(&self, info: &[u8], out: &mut [u8]) {
-        Hkdf::<Sha256>::new(None, &self.0[..]).expand(info, out).expect("HKDF-SHA256 gives up to 8160 bytes");
+        wiping_stack(|| Hkdf::<Sha256>::new(None, &self.0[..]).expand(info, out))
+            .expect("HKDF-SHA256 gives up to 8160 bytes");
     }
 
     /// A subkey: 32 bytes of [`Key::expand`].
@@ -60,6 +68,36 @@ impl Drop for Key {
     fn drop(&mut self) {
         self.0.zeroize();
     }
+}
+
+/// How much stack below a call [`wipe_stack`] overwrites: more than Argon2, a hash or a
+/// lock's SQL takes.
+const STACK: usize = 64 << 10;
+
+/// Runs `work`, then overwrites the stack it used: see [`wipe_stack`].
+pub(crate) fn wiping_stack<T>(work: impl FnOnce() -> T) -> T {
+    let result = below(work);
+    wipe_stack();
+    result
+}
+
+/// `work` in a frame of its own, below the caller's – where [`wipe_stack`] then reaches.
+#[inline(never)]
+fn below<T>(work: impl FnOnce() -> T) -> T {
+    work()
+}
+
+/// Overwrites with zeros the 64 KiB of stack below the caller, where the calls it made have
+/// run: what hashes and key setups leave in their frames – SHA-256's message schedule, HMAC's
+/// padded key, the pseudorandom key HKDF drops – which no `Drop` reaches. Temple does this
+/// after deriving keys and after a lock; a binding that runs Temple's calls on a thread of
+/// its own can do it after each. Best effort: registers, and copies the compiler places
+/// elsewhere, stay as they are.
+#[inline(never)]
+pub fn wipe_stack() {
+    let mut stack = [0u64; STACK / 8];
+    stack.zeroize();
+    std::hint::black_box(&stack);
 }
 
 /// Fills `out` from the operating system's random source.

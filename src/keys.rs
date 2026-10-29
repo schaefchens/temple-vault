@@ -1,6 +1,6 @@
 //! From words to keys: Argon2id to the phrase key, HKDF-SHA256 from there.
 
-use crate::crypto::Key;
+use crate::crypto::{Key, wiping_stack};
 use crate::slots::SLOTS;
 use crate::words::Words;
 use argon2::{Algorithm, Argon2, Block, Params, Version};
@@ -22,17 +22,18 @@ impl PhraseKey {
     /// Argon2id over the words' 128 random bits: deliberately slow, a tenth of a second
     /// or more.
     pub fn from_words(words: &Words) -> PhraseKey {
-        let params = Params::new(MEMORY_KIB, PASSES, LANES, Some(32)).expect("valid Argon2 parameters");
-        let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-        let mut memory = vec![Block::default(); MEMORY_KIB as usize];
-        let mut out = [0u8; 32];
-        argon2
-            .hash_password_into_with_memory(words.bits(), SALT, &mut out, &mut memory[..])
-            .expect("Argon2 takes 16 bytes of password and this salt");
-        memory.zeroize();
-        let key = PhraseKey(Key::from_bytes(&out));
-        out.zeroize();
-        key
+        wiping_stack(|| {
+            let params = Params::new(MEMORY_KIB, PASSES, LANES, Some(32)).expect("valid Argon2 parameters");
+            let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+            let mut memory = vec![Block::default(); MEMORY_KIB as usize];
+            let key = Key::filled(|out| {
+                argon2
+                    .hash_password_into_with_memory(words.bits(), SALT, out, &mut memory[..])
+                    .expect("Argon2 takes 16 bytes of password and this salt")
+            });
+            memory.zeroize();
+            PhraseKey(key)
+        })
     }
 
     /// A phrase key the app kept, as [`PhraseKey::as_bytes`] gave it.
@@ -84,15 +85,16 @@ impl fmt::Debug for PhraseKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NewWords;
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
     use wasm_bindgen_test::wasm_bindgen_test as test;
 
     #[test]
     fn same_words_same_key() {
-        let words = Words::generate();
+        let words = NewWords::generate();
         let again = Words::from_indices(words.indices()).unwrap();
         assert_eq!(PhraseKey::from_words(&words).as_bytes(), PhraseKey::from_words(&again).as_bytes());
-        assert_ne!(PhraseKey::from_words(&words).as_bytes(), PhraseKey::from_words(&Words::generate()).as_bytes());
+        assert_ne!(PhraseKey::from_words(&words).as_bytes(), PhraseKey::from_words(&NewWords::generate()).as_bytes());
     }
 
     /// The outer format can't change after v1, so its keys are pinned here. Computed apart

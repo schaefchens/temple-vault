@@ -38,15 +38,18 @@ fn a_rebuilt_vault_holds_the_spaces_opened_for_it() {
     // The everyday space first, into a fresh vault; then one hidden space. The other stays.
     let new = Memory::new();
     let everyday = unlock(&vault, 0).unwrap();
-    let (rebuilt, ()) = Vault::create_on(new.clone(), SMALL_NOISE, |file| everyday.copy_to(file, true)).unwrap();
+    let (rebuilt, ()) = Vault::create_on(new.clone(), SMALL_NOISE, |file, _claim| {
+        everyday.copy_to(file, phrase(0).1.duplicate(), true)
+    })
+    .unwrap();
     everyday.lock().unwrap();
     let hidden = unlock(&vault, 1).unwrap();
-    hidden.copy_into(&rebuilt).unwrap();
-    assert!(matches!(hidden.copy_into(&rebuilt), Err(Error::WordsInUse)));
+    hidden.copy_into(&rebuilt, None).unwrap();
+    assert!(matches!(hidden.copy_into(&rebuilt, None), Err(Error::WordsInUse)));
     hidden.lock().unwrap();
     drop(rebuilt);
 
-    let rebuilt = Vault::open_on(new.clone(), SMALL_NOISE).unwrap();
+    let rebuilt = Vault::open_on(new.clone(), SMALL_NOISE, false).unwrap();
     let everyday = unlock(&rebuilt, 0).unwrap();
     assert_eq!(notes(&everyday), ["everyday"]);
     assert!(everyday.read_object(kept, 0..audio.len() as u64).unwrap() == audio);
@@ -67,7 +70,9 @@ fn a_copy_is_one_go_with_room_for_everything() {
     let content = vec![7u8; 30 << 20];
     let id = space.put_object(&content[..]).unwrap();
     let new = Memory::new();
-    let (rebuilt, ()) = Vault::create_on(new.clone(), SMALL_NOISE, |file| space.copy_to(file, true)).unwrap();
+    let (rebuilt, ()) =
+        Vault::create_on(new.clone(), SMALL_NOISE, |file, _claim| space.copy_to(file, phrase(0).1.duplicate(), true))
+            .unwrap();
     // 30 MB and an eighth more, 2 MiB for the log: 37 zones, without a growth step.
     assert_eq!(new.bytes().len() as u64, (2 + 37 + 3) * ZONE);
     space.lock().unwrap();
@@ -86,9 +91,30 @@ fn a_copy_of_many_small_objects_does_not_grow() {
         space.put_object(&vec![(i % 251) as u8; 4100][..]).unwrap();
     }
     let new = Memory::new();
-    let (rebuilt, ()) = Vault::create_on(new.clone(), SMALL_NOISE, |file| space.copy_to(file, true)).unwrap();
+    let (rebuilt, ()) =
+        Vault::create_on(new.clone(), SMALL_NOISE, |file, _claim| space.copy_to(file, phrase(0).1.duplicate(), true))
+            .unwrap();
     space.lock().unwrap();
     let copy = unlock(&rebuilt, 0).unwrap();
     assert_eq!(copy.zones().len(), 1, "{:?}", copy.zones());
     assert_eq!(copy.read_object(500, 0..4100).unwrap(), vec![(499 % 251) as u8; 4100]);
+}
+
+/// From this review: rebuilding after words leaked kept them – a copy opened under the same
+/// words, so that the leaked ones read its fresh master key. Rebuilt under new words, the old
+/// ones open nothing in it.
+#[test]
+fn a_vault_rebuilt_under_new_words_opens_only_with_them() {
+    let old = Memory::new();
+    let (_vault, space) = create_on(&old, 0, Setup::default());
+    space.db().execute_batch("CREATE TABLE note (body TEXT); INSERT INTO note VALUES ('kept');").unwrap();
+    let new = Memory::new();
+    let (rebuilt, ()) = Vault::create_on(new, SMALL_NOISE, |_file, _claim| Ok(())).unwrap();
+    space.copy_into(&rebuilt, Some(&phrase(1).0)).unwrap();
+    let master = space.master_key();
+    space.lock().unwrap();
+    assert!(unlock(&rebuilt, 0).is_none());
+    let copy = unlock(&rebuilt, 1).unwrap();
+    assert_eq!(notes(&copy), ["kept"]);
+    assert_ne!(copy.master_key().as_bytes(), master.as_bytes());
 }

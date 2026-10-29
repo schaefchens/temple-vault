@@ -24,6 +24,10 @@ export type ErrorKind =
   /** The words already open a space in this vault. */
   | 'WordsInUse'
   | 'NoSuchObject'
+  /** The vault was opened read-only, or the space salvaged: nothing is written. */
+  | 'ReadOnly'
+  /** Stopped by a lock that didn't wait for it. */
+  | 'Interrupted'
   /** The space has locked; its words open it again. */
   | 'Locked'
   | 'NotFound'
@@ -51,15 +55,31 @@ export class TempleError extends Error {
   }
 }
 
+/**
+ * Fresh words from `generateWords` – the only words a new vault, a new space or a word change takes: Argon2's salt is the
+ * same in every vault, so words someone picked would be open to one precomputation against all of them.
+ */
+export interface NewWords {
+  /** The 12 indices into a list of 2048, to show the user; the app brings the list. They open the space as typed words do. */
+  readonly indices: number[];
+}
+
 /** Temple on one platform. A path is a file path on iOS and Android, a file name on the web. */
 export interface Temple {
-  /** 12 fresh words, as indices into a list of 2048; the app brings the list. */
-  generateWords(): Promise<number[]>;
+  /** 12 fresh words. */
+  generateWords(): Promise<NewWords>;
   /** Whether 12 indices are words: each below 2048, the checksum right. */
   wordsAreValid(words: number[]): Promise<boolean>;
   /** A new vault with its first space, open; `room`: bytes of content to hold from the start. */
-  createVault(path: string, words: number[], options?: { room?: number }): Promise<{ vault: Vault; space: Space }>;
-  openVault(path: string): Promise<Vault>;
+  createVault(path: string, words: NewWords, options?: { room?: number }): Promise<{ vault: Vault; space: Space }>;
+  /** `readOnly`: nothing is written to the vault – its spaces open read-only and leave no trace; for read-only storage, or to look without one. */
+  openVault(path: string, options?: { readOnly?: boolean }): Promise<Vault>;
+  /**
+   * Marks the file at `path` to be left out of backups – iCloud's and the computer's on iOS, where every backup is another
+   * copy of the vault. Whether the system keeps such a mark: on Android the app's manifest leaves files out, and the web's
+   * private files aren't backed up.
+   */
+  excludeFromBackup(path: string): Promise<boolean>;
 }
 
 /** One file holding any number of spaces, each opened by its own 12 words. */
@@ -68,8 +88,10 @@ export interface Vault {
   unlock(words: number[]): Promise<Space | null>;
   /** Quick unlock with a phrase key the app kept from `Space.phraseKey`. */
   unlockWithKey(key: Uint8Array): Promise<Space | null>;
-  /** A new space for words that open none – once the user confirmed them, so a typo leaves no trace. */
-  createSpace(words: number[], options?: { room?: number }): Promise<Space>;
+  /** What can still be read of a damaged space, read-only – to copy into a new vault, or out. Writes nothing to the vault. */
+  salvage(words: number[]): Promise<Space | null>;
+  /** A new space under fresh words – for words that opened none, once the user confirmed: the words typed never become a space. */
+  createSpace(words: NewWords, options?: { room?: number }): Promise<Space>;
   /** Lets go of the vault; its file closes once its spaces have locked too. */
   close(): void;
 }
@@ -83,6 +105,8 @@ export interface Space {
   query<T extends Row = Row>(sql: string, params?: SqlValue[]): Promise<T[]>;
   /** Stores bytes as a new object – audio, a document – and returns its id; inside a transaction, it commits or rolls back with it. */
   putObject(content: Uint8Array): Promise<number>;
+  /** A new object written piece by piece – content too large to hold at once, such as a download. */
+  writeObject(): Promise<ObjectWriter>;
   /** An object's bytes from `start` to `end`, or to its end. */
   readObject(id: number, start?: number, end?: number): Promise<Uint8Array>;
   objectLength(id: number): Promise<number>;
@@ -90,17 +114,27 @@ export interface Space {
   /** 32 bytes for quick unlock, for the app to seal with the device's secure hardware. */
   phraseKey(): Promise<Uint8Array>;
   changedElsewhere(): Promise<boolean>;
+  /** In a vault opened read-only, or salvaged. */
+  isReadOnly(): Promise<boolean>;
   /** New words for this space; a kept phrase key stops working. Interrupted, both words open the space until the change is made again from the old ones. */
-  changeWords(words: number[]): Promise<void>;
+  changeWords(words: NewWords): Promise<void>;
   /** Words that open this space no more – the old ones after an interrupted change; whether they did. */
   forgetWords(words: number[]): Promise<boolean>;
   /** Removes every other space of the vault at once. */
   keepOnlyThis(): Promise<void>;
-  /** A new vault holding a copy of this space under the same words: rebuilding a vault. */
-  copyToNewVault(path: string): Promise<Vault>;
-  /** Copies this space into another vault under the same words. */
-  copyInto(vault: Vault): Promise<void>;
-  /** Locks the space: deleted values become unreadable, keys are wiped. */
+  /** A new vault holding a copy of this space: rebuilding a vault. Under the same words, or new ones after words leaked – the copy then opens only with those. */
+  copyToNewVault(path: string, options?: { words?: NewWords }): Promise<Vault>;
+  /** Copies this space into another vault, under the same words or new ones. */
+  copyInto(vault: Vault, options?: { words?: NewWords }): Promise<void>;
+  /** Locks the space: deleted values become unreadable, keys are wiped. It doesn't wait: on iOS and Android, work still running on the space fails as "Interrupted". */
   lock(): Promise<void>;
   isLocked(): Promise<boolean>;
+}
+
+/** An object written piece by piece. One never finished leaves nothing behind once its space opens again. */
+export interface ObjectWriter {
+  /** Adds the next piece. A piece that fails ends the object – it may be half written: begin it again. */
+  write(bytes: Uint8Array): Promise<void>;
+  /** Stores the object; returns its id. Inside a transaction, it commits or rolls back with it. */
+  finish(): Promise<number>;
 }

@@ -132,6 +132,24 @@ unsafe fn handle<'a>(file: *mut ffi::sqlite3_file) -> &'a mut Handle {
     unsafe { &mut *(file as *mut Handle) }
 }
 
+/// SQLite's code for `result`; a failure is noted in the store, where [`Space::explain`]
+/// finds it behind SQLite's I/O error.
+///
+/// [`Space::explain`]: super::Space::explain
+fn code<T>(h: &Handle, result: Result<T, Error>, failed: c_int) -> c_int {
+    match result {
+        Ok(_) => ffi::SQLITE_OK,
+        Err(e) => {
+            if !h.store.is_null()
+                && let Some(mut store) = h.store()
+            {
+                store.failure = Some(e);
+            }
+            failed
+        }
+    }
+}
+
 static IO: ffi::sqlite3_io_methods = ffi::sqlite3_io_methods {
     iVersion: 1,
     xClose: Some(x_close),
@@ -162,6 +180,7 @@ unsafe extern "C" fn x_open(
     out_flags: *mut c_int,
 ) -> c_int {
     unsafe { (*file).pMethods = ptr::null() };
+    let mut opened = flags;
     let (kind, store) = if name.is_null() {
         (Kind::Memory, ptr::null())
     } else {
@@ -187,6 +206,10 @@ unsafe extern "C" fn x_open(
                 Kind::Log if store.database_open && !store.log_open => store.log_open = true,
                 _ => return ffi::SQLITE_CANTOPEN,
             }
+            // SQLite opens the log for writing, and only reads it once told it can't write.
+            if store.opened_read_only {
+                opened = flags & !(ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_CREATE) | ffi::SQLITE_OPEN_READONLY;
+            }
         }
         (kind, if kind == Kind::Memory { ptr::null() } else { Arc::into_raw(store) })
     };
@@ -194,7 +217,7 @@ unsafe extern "C" fn x_open(
         if kind == Kind::Memory { Box::into_raw(Box::new(Zeroizing::new(Vec::new()))) } else { ptr::null_mut() };
     unsafe { (file as *mut Handle).write(Handle { base: ffi::sqlite3_file { pMethods: &IO }, kind, store, memory }) };
     if !out_flags.is_null() {
-        unsafe { *out_flags = flags };
+        unsafe { *out_flags = opened };
     }
     ffi::SQLITE_OK
 }
@@ -239,7 +262,7 @@ unsafe extern "C" fn x_read(file: *mut ffi::sqlite3_file, buf: *mut c_void, amou
             out[n..].fill(0);
             ffi::SQLITE_IOERR_SHORT_READ
         }
-        Err(_) => ffi::SQLITE_IOERR_READ,
+        Err(e) => code::<()>(h, Err(e), ffi::SQLITE_IOERR_READ),
     }
 }
 
@@ -265,7 +288,7 @@ unsafe extern "C" fn x_write(file: *mut ffi::sqlite3_file, buf: *const c_void, a
             None => Err(Error::Damaged),
         },
     };
-    if written.is_ok() { ffi::SQLITE_OK } else { ffi::SQLITE_IOERR_WRITE }
+    code(h, written, ffi::SQLITE_IOERR_WRITE)
 }
 
 unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_int {
@@ -280,7 +303,7 @@ unsafe extern "C" fn x_truncate(file: *mut ffi::sqlite3_file, size: i64) -> c_in
             None => Err(Error::Damaged),
         },
     };
-    if truncated.is_ok() { ffi::SQLITE_OK } else { ffi::SQLITE_IOERR_TRUNCATE }
+    code(h, truncated, ffi::SQLITE_IOERR_TRUNCATE)
 }
 
 unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, _flags: c_int) -> c_int {
@@ -292,7 +315,7 @@ unsafe extern "C" fn x_sync(file: *mut ffi::sqlite3_file, _flags: c_int) -> c_in
             None => Err(Error::Damaged),
         },
     };
-    if synced.is_ok() { ffi::SQLITE_OK } else { ffi::SQLITE_IOERR_FSYNC }
+    code(h, synced, ffi::SQLITE_IOERR_FSYNC)
 }
 
 unsafe extern "C" fn x_file_size(file: *mut ffi::sqlite3_file, size: *mut i64) -> c_int {

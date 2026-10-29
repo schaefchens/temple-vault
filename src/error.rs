@@ -21,6 +21,10 @@ pub enum Error {
     WordsInUse,
     /// The space has no object with this id.
     NoSuchObject,
+    /// The vault was opened read-only, or the space salvaged: nothing is written.
+    ReadOnly,
+    /// Stopped from another thread – to lock the space without waiting for it.
+    Interrupted,
     Database(rusqlite::Error),
     Io(io::Error),
 }
@@ -36,6 +40,8 @@ impl fmt::Display for Error {
             Error::SpaceOpen => f.write_str("a space of this vault is open"),
             Error::WordsInUse => f.write_str("these words already open a space"),
             Error::NoSuchObject => f.write_str("no such object"),
+            Error::ReadOnly => f.write_str("the vault is open read-only"),
+            Error::Interrupted => f.write_str("interrupted"),
             Error::Database(e) => write!(f, "database: {e}"),
             Error::Io(e) => write!(f, "{e}"),
         }

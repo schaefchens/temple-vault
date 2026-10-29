@@ -3,11 +3,13 @@
 use super::objects::ObjectId;
 use super::runs;
 use super::store::{PAYLOAD, Store};
-use super::{Space, connect, zones_for};
-use crate::crypto::{Key, TAG};
+use super::{Access, Open, Space, connect, zones_for};
+use crate::crypto::{Key, TAG, wiping_stack};
+use crate::keys::PhraseKey;
 use crate::noise;
 use crate::slots::{INNER_VERSION, KeyBlock};
 use crate::vault::{Vault, VaultFile};
+use crate::words::NewWords;
 use crate::{BLOCK, Error};
 use rusqlite::Connection;
 #[cfg(unix)]
@@ -16,34 +18,54 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 impl Space {
-    /// A new vault at `path` holding a copy of this space under the same words: the first
-    /// step of rebuilding a vault, with the everyday space. The reserve follows it, and the
-    /// vault is written to a temporary file and renamed into place.
+    /// A new vault at `path` holding a copy of this space: the first step of rebuilding a
+    /// vault, with the everyday space. Under the same words – or under `new_words` after words
+    /// leaked: the copy opens only with those, and its fresh master key is one the old words
+    /// never wrapped. The reserve follows it, and the vault is written to a temporary file
+    /// and renamed into place.
     #[cfg(unix)]
-    pub fn copy_to_new_vault(&self, path: impl AsRef<Path>) -> Result<Vault, Error> {
-        Vault::create_at(path.as_ref(), noise::REAL, |file| self.copy_to(file, true)).map(|(vault, ())| vault)
+    pub fn copy_to_new_vault(&self, path: impl AsRef<Path>, new_words: Option<&NewWords>) -> Result<Vault, Error> {
+        let key = self.copy_key(new_words);
+        Vault::create_at(path.as_ref(), noise::REAL, |file, _claim| self.copy_to(file, key, true))
+            .map(|(vault, ())| vault)
     }
 
     /// On the web: [`Space::copy_to_new_vault`] into an empty file of the origin private
     /// file system, through a sync access handle to it – named as
     /// [`Vault::create_with_handle`] describes.
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
-    pub fn copy_to_new_vault_with_handle(&self, handle: web_sys::FileSystemSyncAccessHandle) -> Result<Vault, Error> {
+    pub fn copy_to_new_vault_with_handle(
+        &self,
+        handle: web_sys::FileSystemSyncAccessHandle,
+        new_words: Option<&NewWords>,
+    ) -> Result<Vault, Error> {
+        let key = self.copy_key(new_words);
         let device = Arc::new(crate::device::OpfsDevice::new(handle));
-        Vault::create_on(device, noise::REAL, |file| self.copy_to(file, true)).map(|(vault, ())| vault)
+        Vault::create_on(device, noise::REAL, |file, _claim| self.copy_to(file, key, true)).map(|(vault, ())| vault)
     }
 
-    /// Copies this space into another vault under the same words: the next steps of
-    /// rebuilding a vault, with hidden spaces. Copied in one go – appended with room for all
-    /// it holds, which leaves out deleted content – and its key blocks written last, so a
-    /// crash leaves only noise.
-    pub fn copy_into(&self, vault: &Vault) -> Result<(), Error> {
-        let _claim = vault.file.claim().ok_or(Error::SpaceOpen)?;
-        self.copy_to(&vault.file, false)
+    /// Copies this space into another vault, under the same words or `new_words`: the next
+    /// steps of rebuilding a vault, with hidden spaces. Copied in one go – appended with room
+    /// for all it holds, which leaves out deleted content – and its key blocks written last,
+    /// so a crash leaves only noise.
+    pub fn copy_into(&self, vault: &Vault, new_words: Option<&NewWords>) -> Result<(), Error> {
+        vault.file.writable()?;
+        let key = self.copy_key(new_words);
+        let _claim = vault.file.claim()?;
+        self.copy_to(&vault.file, key, false)
     }
 
-    pub(crate) fn copy_to(&self, file: &Arc<VaultFile>, first: bool) -> Result<(), Error> {
-        if file.find_key_block(&self.key.wrapping_key(), self.key.slots())?.is_some() {
+    fn copy_key(&self, new_words: Option<&NewWords>) -> PhraseKey {
+        new_words.map_or_else(|| self.key.duplicate(), |words| PhraseKey::from_words(words))
+    }
+
+    pub(crate) fn copy_to(&self, file: &Arc<VaultFile>, key: PhraseKey, first: bool) -> Result<(), Error> {
+        self.begin_work();
+        wiping_stack(|| self.copy_with(file, key, first))
+    }
+
+    fn copy_with(&self, file: &Arc<VaultFile>, key: PhraseKey, first: bool) -> Result<(), Error> {
+        if file.find_key_block(&key.wrapping_key(), key.slots())?.is_some() {
             return Err(Error::WordsInUse);
         }
         file.take_over()?;
@@ -59,11 +81,11 @@ impl Space {
         }
         let block = KeyBlock { inner_version: INNER_VERSION, generation: 1, master_key: Key::random(), first_zone };
         let store = Store::create(file.clone(), &block.master_key, first_zone, zones)?;
-        let mut copy = Space::new(file.clone(), None, self.key.duplicate(), block, store);
+        let mut copy = Space::new(file.clone(), None, key, block, store, Access::Write);
         // VACUUM INTO writes a compact copy of the database; SQLite opens it through the
         // VFS under the copy's name. Then the copy turns to WAL mode.
         self.sql(self.db().execute("VACUUM INTO ?1", [&copy.name]))?;
-        copy.db = Some(connect(&copy.name, false, &copy.store)?);
+        copy.db = Some(connect(&copy.name, Open::Existing, &copy.store)?);
         // All rows in one transaction, so that the log stays small.
         let rows = copy.sql(copy.db().unchecked_transaction())?;
         for (id, _) in objects {
@@ -84,6 +106,7 @@ impl Space {
         let runs = self.store.lock().unwrap().allocate(count, count, 1)?;
         let mut block = Zeroizing::new([0u8; BLOCK]);
         for index in 0..u64::from(count) {
+            source.go_on()?;
             let from = runs::nth(&object.runs, index).ok_or(Error::Damaged)?;
             if !source.store.lock().unwrap().read_block(from, &object.key, &mut block)? {
                 return Err(Error::Damaged);

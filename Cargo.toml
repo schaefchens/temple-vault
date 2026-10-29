@@ -7,14 +7,17 @@ description = "Vaults: one file, any number of spaces, each opened by its own 12
 publish = false
 
 [dependencies]
-argon2 = { version = "0.5", default-features = false, features = ["alloc", "zeroize"] }
+argon2 = { version = "0.6", default-features = false, features = ["zeroize"] }
 chacha20 = "0.10"
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["zeroize"] }
 getrandom = "0.4"
-hkdf = "0.12"
+hkdf = "0.13"
 rusqlite = { version = "0.41", features = ["bundled"] }
-sha2 = "0.10"
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
 zeroize = "1"
+# Only for their `zeroize`: the hash states inside Argon2 and HKDF are wiped when dropped.
+blake2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+hmac = { version = "0.13", features = ["zeroize"] }
 
 # On the web: the browser's random source and clock, and its origin private file system.
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]

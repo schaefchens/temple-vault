@@ -1,12 +1,16 @@
 # Temple's tests on every push: the Rust suite natively – optimized, and once as a debug build
 # for its overflow checks – and on wasm32, the bindings crate, formatting, clippy, RustSec's
-# advisories, and the web demo's Playwright run – Chromium and Firefox on Linux, WebKit on
-# macOS. The React Native E2E run needs simulators and stays local: tools/e2e_react_native.sh.
+# advisories, the React hooks, a few minutes of fuzzing per target, and the web demo's
+# Playwright run – Chromium and Firefox on Linux, WebKit on macOS. Weekly, the fuzzers run an
+# hour each. The React Native E2E run needs simulators and stays local:
+# tools/e2e_react_native.sh. Actions are pinned by commit.
 name: CI
 
 on:
   push:
   pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
@@ -18,28 +22,34 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: stable
           components: clippy, rustfmt
       - run: cargo fmt --check
+      - run: cargo fmt --check --manifest-path bindings/ffi/Cargo.toml
       - run: cargo clippy --release --locked --all-targets -- -D warnings
       - run: cargo test --release --locked
-      - run: cargo check --manifest-path bindings/ffi/Cargo.toml --locked
+      - run: cargo clippy --manifest-path bindings/ffi/Cargo.toml --locked -- -D warnings
 
   rust-debug:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
       # Integer overflow is caught only without --release.
       - run: cargo test --locked
 
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
       - run: cargo install cargo-audit --locked
       - run: cargo audit
       # Warns of basic-toml, unmaintained, which UniFFI's templates use while building.
@@ -52,17 +62,49 @@ jobs:
       CC_wasm32_unknown_unknown: clang
       AR_wasm32_unknown_unknown: llvm-ar
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
       - run: sudo apt-get install -y clang llvm
       - name: wasm-bindgen-cli at Cargo.lock's version
         run: cargo install wasm-bindgen-cli --locked --version "$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')"
       - run: tools/test_on_wasm.sh
+
+  react:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test -w @schaefchens/temple-react
+
+  fuzz:
+    runs-on: ubuntu-latest
+    env:
+      SECONDS_PER_TARGET: ${{ github.event_name == 'schedule' && 3600 || 180 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: nightly
+      - run: cargo install cargo-fuzz --locked
+      # The corpus grows from run to run.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - run: |
+          for target in superblock slot_table space; do
+            cargo fuzz run "$target" -- -max_total_time="$SECONDS_PER_TARGET"
+          done
 
   web-e2e:
     strategy:
@@ -79,11 +121,12 @@ jobs:
             projects: --project=webkit
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: stable
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
       # LLVM's clang and ar for SQLite's C code; bindings/web/build.sh finds Homebrew's.

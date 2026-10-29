@@ -3,18 +3,19 @@
 //! format's memory (docs/format.md, "From words to keys"). On an Android phone connected over USB:
 //! `tools/argon2_on_android.sh`.
 
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use std::time::{Duration, Instant};
-use temple_vault::{PhraseKey, Words};
+use temple_vault::{NewWords, PhraseKey};
 
 fn main() {
-    let words = Words::generate();
+    let words = NewWords::generate();
     let format = times(|| drop(PhraseKey::from_words(&words)));
     let half = times(|| {
         let params = Params::new(32 * 1024, 3, 4, Some(32)).unwrap();
         let mut key = [0u8; 32];
+        let mut memory = vec![Block::default(); 32 * 1024];
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-            .hash_password_into(&[7; 16], b"temple-vault-v1", &mut key)
+            .hash_password_into_with_memory(&[7; 16], b"temple-vault-v1", &mut key, &mut memory[..])
             .unwrap();
     });
     println!("Argon2id, 3 passes, 4 lanes – median (fastest–slowest) of 7:");

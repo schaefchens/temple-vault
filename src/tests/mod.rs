@@ -13,7 +13,7 @@ mod spaces;
 use crate::crypto::{Key, NONCE, open_trailing};
 use crate::keys::PhraseKey;
 use crate::noise::Amounts;
-use crate::words::Words;
+use crate::words::NewWords;
 use crate::{BLOCK, ZONE};
 use chacha20::XChaCha20;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
@@ -28,19 +28,19 @@ pub(crate) fn create_on(
     n: usize,
     setup: crate::Setup,
 ) -> (crate::Vault, crate::Space) {
-    crate::Vault::create_on(memory.clone(), SMALL_NOISE, |file| {
-        crate::Space::create(file, file.claim(), phrase(n).1.duplicate(), setup, true)
+    crate::Vault::create_on(memory.clone(), SMALL_NOISE, |file, claim| {
+        crate::Space::create(file, Some(claim), phrase(n).1.duplicate(), setup, true)
     })
     .unwrap()
 }
 
 /// Argon2 is slow on purpose; tests derive a few keys once and reuse them.
-pub(crate) fn phrase(n: usize) -> &'static (Words, PhraseKey) {
-    static PHRASES: OnceLock<Vec<(Words, PhraseKey)>> = OnceLock::new();
+pub(crate) fn phrase(n: usize) -> &'static (NewWords, PhraseKey) {
+    static PHRASES: OnceLock<Vec<(NewWords, PhraseKey)>> = OnceLock::new();
     &PHRASES.get_or_init(|| {
         (0..4)
             .map(|_| {
-                let words = Words::generate();
+                let words = NewWords::generate();
                 let key = PhraseKey::from_words(&words);
                 (words, key)
             })

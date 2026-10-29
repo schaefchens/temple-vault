@@ -30,74 +30,161 @@ pub(super) struct Object {
     pub(super) runs: Vec<Run>,
 }
 
+/// An object written piece by piece – for content that arrives in pieces, as through the
+/// bindings: from [`Space::begin_object`], each piece through [`Space::write_object`], and
+/// stored by [`Space::finish_object`]. Until then nothing points at its blocks: an object
+/// never finished leaves them free from the space's next opening. A piece that fails to be
+/// written ends the object, its blocks free at once; it is begun again.
+pub struct ObjectWriter {
+    /// The space it belongs to, by the name of its database.
+    space: String,
+    key: Key,
+    used: Vec<Run>,
+    /// What's left of the blocks last allocated.
+    spare: Vec<Run>,
+    size: u64,
+    /// The block being filled: `filled` bytes so far.
+    block: Box<Zeroizing<[u8; BLOCK]>>,
+    filled: usize,
+    /// Writing failed: the object is gone.
+    failed: bool,
+}
+
 impl Space {
     /// Stores `content` as a new object and returns its id. Its blocks are written and
     /// synced before the row that points at them commits – with a transaction the app has
     /// open, so that the app's own rows for the object commit with it. Rolled back, the
     /// object is gone, and its blocks are free from the next opening.
     pub fn put_object(&self, mut content: impl Read) -> Result<ObjectId, Error> {
-        let key = Key::random();
-        let mut used = Vec::new();
-        let mut spare = Vec::new();
-        let written = self.write_object(&mut content, &key, &mut used, &mut spare);
-        self.store.lock().unwrap().give_back(&spare);
-        let size = match written.and_then(|size| self.store.lock().unwrap().sync().map(|()| size)) {
-            Ok(size) => size,
-            Err(e) => {
-                // Nothing points at them yet.
-                self.store.lock().unwrap().give_back(&used);
-                return Err(e);
+        let mut object = self.begin_object()?;
+        self.begin_work();
+        let mut piece = Zeroizing::new([0u8; PAYLOAD]);
+        let written = loop {
+            match read_full(&mut content, &mut piece[..]) {
+                Ok(0) => break Ok(()),
+                Ok(n) => {
+                    if let Err(e) = self.write_pieces(&mut object, &piece[..n]) {
+                        break Err(e);
+                    }
+                }
+                Err(e) => break Err(e.into()),
             }
         };
+        match written {
+            Ok(()) => self.finish_object(object),
+            Err(e) => {
+                self.end(&mut object);
+                Err(e)
+            }
+        }
+    }
+
+    /// A new object, empty so far.
+    pub fn begin_object(&self) -> Result<ObjectWriter, Error> {
+        self.writable()?;
+        Ok(ObjectWriter {
+            space: self.name.clone(),
+            key: Key::random(),
+            used: Vec::new(),
+            spare: Vec::new(),
+            size: 0,
+            block: Box::new(Zeroizing::new([0; BLOCK])),
+            filled: 0,
+            failed: false,
+        })
+    }
+
+    /// Adds `bytes` to an object, writing every block they fill.
+    pub fn write_object(&self, object: &mut ObjectWriter, bytes: &[u8]) -> Result<(), Error> {
+        self.owns(object)?;
+        self.begin_work();
+        let written = self.write_pieces(object, bytes);
+        if written.is_err() {
+            self.end(object);
+        }
+        written
+    }
+
+    fn write_pieces(&self, object: &mut ObjectWriter, mut bytes: &[u8]) -> Result<(), Error> {
+        self.writable()?;
+        self.owns(object)?;
+        while !bytes.is_empty() {
+            let n = (PAYLOAD - object.filled).min(bytes.len());
+            object.block[object.filled..object.filled + n].copy_from_slice(&bytes[..n]);
+            object.filled += n;
+            bytes = &bytes[n..];
+            if object.filled == PAYLOAD {
+                self.go_on()?;
+                self.store_block(object)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the block being filled, in blocks allocated in chunks that grow with the object,
+    /// so that a large one lies in few runs.
+    fn store_block(&self, object: &mut ObjectWriter) -> Result<(), Error> {
+        object.block[object.filled..].fill(0);
+        let mut store = self.store.lock().unwrap();
+        if object.spare.is_empty() {
+            let chunk = (runs::count(&object.used) / 2).clamp(256, 65536) as u32;
+            object.spare = store.allocate(1, chunk, 1)?;
+        }
+        let number = object.spare[0].start;
+        object.spare[0] = Run { start: number + 1, len: object.spare[0].len - 1 };
+        if object.spare[0].len == 0 {
+            object.spare.remove(0);
+        }
+        runs::push(&mut object.used, Run { start: number, len: 1 });
+        store.write_block(number, &object.key, &mut object.block)?;
+        object.size += object.filled as u64;
+        object.filled = 0;
+        Ok(())
+    }
+
+    /// Stores an object written with [`Space::write_object`]: its last block, synced, then
+    /// its row – as [`Space::put_object`] does. Returns its id.
+    pub fn finish_object(&self, mut object: ObjectWriter) -> Result<ObjectId, Error> {
+        self.writable()?;
+        self.owns(&object)?;
+        let last = if object.filled > 0 { self.store_block(&mut object) } else { Ok(()) };
+        if let Err(e) = last.and_then(|()| self.store.lock().unwrap().sync()) {
+            self.end(&mut object);
+            return Err(e);
+        }
+        self.store.lock().unwrap().give_back(&std::mem::take(&mut object.spare));
         // A commit that fails may still come back from the log after a crash, so its blocks
         // stay out of use until the next opening, which works out the free ones anew.
         self.as_temple(|db| {
             db.execute(
                 "INSERT INTO temple_objects (key, size, blocks) VALUES (?1, ?2, ?3)",
-                params![&key.as_bytes()[..], size as i64, runs::encode(&used)],
+                params![&object.key.as_bytes()[..], object.size as i64, runs::encode(&object.used)],
             )
         })?;
         Ok(self.db().last_insert_rowid())
     }
 
-    /// Writes `content` in blocks, allocated in chunks that grow with the object so that a
-    /// large one lies in few runs. Returns its size; `spare` holds what's left of the chunk.
-    fn write_object(
-        &self,
-        content: &mut impl Read,
-        key: &Key,
-        used: &mut Vec<Run>,
-        spare: &mut Vec<Run>,
-    ) -> Result<u64, Error> {
-        let mut size = 0u64;
-        let mut block = Zeroizing::new([0u8; BLOCK]);
-        loop {
-            let n = read_full(content, &mut block[..PAYLOAD])?;
-            if n == 0 {
-                return Ok(size);
-            }
-            block[n..].fill(0);
-            let mut store = self.store.lock().unwrap();
-            if spare.is_empty() {
-                let chunk = (runs::count(used) / 2).clamp(256, 65536) as u32;
-                *spare = store.allocate(1, chunk, 1)?;
-            }
-            let number = spare[0].start;
-            spare[0] = Run { start: number + 1, len: spare[0].len - 1 };
-            if spare[0].len == 0 {
-                spare.remove(0);
-            }
-            runs::push(used, Run { start: number, len: 1 });
-            store.write_block(number, key, &mut block)?;
-            size += n as u64;
-            if n < PAYLOAD {
-                return Ok(size);
-            }
+    fn owns(&self, object: &ObjectWriter) -> Result<(), Error> {
+        if object.space != self.name {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "the object was begun in another space").into());
         }
+        if object.failed {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "writing the object failed: begin it again").into());
+        }
+        Ok(())
+    }
+
+    /// Ends an object that failed to be written: nothing points at its blocks yet.
+    fn end(&self, object: &mut ObjectWriter) {
+        let mut store = self.store.lock().unwrap();
+        store.give_back(&std::mem::take(&mut object.spare));
+        store.give_back(&std::mem::take(&mut object.used));
+        object.failed = true;
     }
 
     /// Bytes `range` of an object, as far as it reaches.
     pub fn read_object(&self, id: ObjectId, range: Range<u64>) -> Result<Vec<u8>, Error> {
+        self.begin_work();
         let object = self.object(id)?;
         let end = range.end.min(object.size);
         // On 32-bit targets such as wasm, a range can exceed what memory holds.
@@ -109,6 +196,7 @@ impl Space {
         let store = self.store.lock().unwrap();
         let mut at = range.start;
         while at < end {
+            self.go_on()?;
             let (index, within) = (at / PAYLOAD as u64, (at % PAYLOAD as u64) as usize);
             let number = runs::nth(&object.runs, index).ok_or(Error::Damaged)?;
             if !store.read_block(number, &object.key, &mut block)? {
@@ -130,6 +218,7 @@ impl Space {
     /// free from the space's next opening – not before, so that a copy of the vault taken
     /// during this session never finds them in use twice.
     pub fn delete_object(&self, id: ObjectId) -> Result<(), Error> {
+        self.writable()?;
         let deleted = self.sql(self.db().execute("DELETE FROM temple_objects WHERE id = ?1", [id]))?;
         if deleted == 0 {
             return Err(Error::NoSuchObject);

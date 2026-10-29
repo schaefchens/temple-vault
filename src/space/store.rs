@@ -8,6 +8,7 @@
 //! if its block's tag is the one the space's tag table holds for it: a page from another
 //! moment – in a copy of the vault taken mid-write, or put back by someone – fails.
 
+use super::Access;
 use super::runs::{self, Free, Run};
 use super::superblock::{self, Extent, FileRecord, Superblock};
 use crate::crypto::{Key, NONCE, TAG, open_trailing, seal_trailing};
@@ -89,6 +90,13 @@ pub(crate) struct Store {
     pub(crate) admin: bool,
     /// Until a space has opened, and once opening or locking failed: nothing may be written.
     pub(crate) read_only: bool,
+    /// Opened read-only, or salvaged: nothing is ever written, and SQLite knows it.
+    pub(crate) opened_read_only: bool,
+    /// Database pages read only with the tag the tag table holds – not when salvaging.
+    checks_tags: bool,
+    /// What failed in the last of SQLite's calls that did, which SQLite reports only as an
+    /// I/O error.
+    pub(crate) failure: Option<Error>,
     /// SQLite has the database open.
     pub(crate) database_open: bool,
     /// SQLite has the log open.
@@ -132,6 +140,9 @@ impl Store {
             locking: None,
             admin: true,
             read_only: false,
+            opened_read_only: false,
+            checks_tags: true,
+            failure: None,
             database_open: false,
             log_open: false,
         }
@@ -139,12 +150,15 @@ impl Store {
 
     /// The store of an existing space: the newest superblock copy whose tag table is intact
     /// and whose last checkpoint is fully present, otherwise the other one. Free blocks come
-    /// with [`Store::init_free`].
-    pub(crate) fn load(vault: Arc<VaultFile>, master: &Key, first_zone: u64) -> Result<Store, Error> {
+    /// with [`Store::init_free`]. Salvaging takes the newest copy that opens, whatever its tag
+    /// table and checkpoint – and zones the file has lost, whose pages then fail when read.
+    pub(crate) fn load(vault: Arc<VaultFile>, master: &Key, first_zone: u64, access: Access) -> Result<Store, Error> {
+        let salvage = access == Access::Salvage;
         let file_zones = vault.len()? / ZONE;
         if first_zone < 2 || first_zone >= file_zones {
             return Err(Error::Damaged);
         }
+        let file_zones = if salvage { u64::MAX } else { file_zones };
         let superblock_key = master.derive(b"temple/v1/superblock");
         let database_key = master.derive(b"temple/v1/db");
         let mut copies = Vec::new();
@@ -173,6 +187,10 @@ impl Store {
             if record.inner_version != INNER_VERSION || !fits(record, first_zone, file_zones) {
                 continue;
             }
+            if salvage {
+                chosen = Some((i, Vec::new()));
+                break;
+            }
             let Some(tags) = load_tags(&vault, &database_key, record)? else { continue };
             if record.session.is_some() || checkpoint_present(&vault, record, &tags)? {
                 chosen = Some((i, tags));
@@ -200,6 +218,8 @@ impl Store {
         // Nothing is written until the space has opened: a failed opening leaves the vault
         // as it was.
         store.read_only = true;
+        store.opened_read_only = access != Access::Write;
+        store.checks_tags = !salvage;
         Ok(store)
     }
 
@@ -283,7 +303,9 @@ impl Store {
         let valid = match (file, &self.session) {
             (File::Database, _) => {
                 self.read_block(number, &self.database_key, block)?
-                    && (!tagged || self.tags.get(index as usize).is_some_and(|tag| block[BLOCK - TAG..] == tag[..]))
+                    && (!tagged
+                        || !self.checks_tags
+                        || self.tags.get(index as usize).is_some_and(|tag| block[BLOCK - TAG..] == tag[..]))
             }
             (File::Log, Some(session)) => self.read_block(number, session, block)?,
             (File::Log, None) => false,
@@ -677,6 +699,17 @@ impl Store {
             }
         }
         self.file_piece = 1;
+    }
+
+    /// Where in the file the tag table starts, and a database page's block – 0 is page 1.
+    #[cfg(test)]
+    pub(crate) fn tag_table_offset(&self) -> u64 {
+        self.offset(self.tag_table.runs[0].start).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn page_offset(&self, index: u64) -> u64 {
+        self.offset(runs::nth(&self.database.runs, index).unwrap()).unwrap()
     }
 
     #[cfg(test)]

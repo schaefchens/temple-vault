@@ -2,14 +2,25 @@
 // module on React Native and in the web's worker. Plain JS values in, plain JS values out:
 // numbers for ids and sizes, Uint8Array for bytes, null for nothing, TempleError for errors.
 
-import { TempleError, type ErrorKind, type Row, type Space, type SqlValue, type Temple, type Vault } from './api';
+import {
+  TempleError,
+  type ErrorKind,
+  type NewWords,
+  type ObjectWriter,
+  type Row,
+  type Space,
+  type SqlValue,
+  type Temple,
+  type Vault,
+} from './api';
 
 /** What `wrap` needs of the generated module; `import * as binding from './generated/temple'`. */
 export interface Binding {
-  generateWords(): number[];
+  generateWords(): BindingNewWords;
   wordsAreValid(words: number[]): boolean;
-  createVault(path: string, words: number[], room: bigint): Promise<{ vault: BindingVault; space: BindingSpace }>;
-  openVault(path: string): Promise<BindingVault>;
+  createVault(path: string, words: BindingNewWords, room: bigint): Promise<{ vault: BindingVault; space: BindingSpace }>;
+  openVault(path: string, readOnly: boolean): Promise<BindingVault>;
+  excludeFromBackup(path: string): Promise<boolean>;
   Value: {
     Null: new () => unknown;
     Integer: new (inner: { value: bigint }) => unknown;
@@ -24,10 +35,15 @@ interface Destroyable {
   uniffiDestroy?(): void;
 }
 
+interface BindingNewWords extends Destroyable {
+  indices(): number[];
+}
+
 interface BindingVault extends Destroyable {
   unlock(words: number[]): Promise<BindingSpace | undefined>;
   unlockWithKey(key: ArrayBuffer): Promise<BindingSpace | undefined>;
-  createSpace(words: number[], room: bigint): Promise<BindingSpace>;
+  salvage(words: number[]): Promise<BindingSpace | undefined>;
+  createSpace(words: BindingNewWords, room: bigint): Promise<BindingSpace>;
 }
 
 interface BindingSpace extends Destroyable {
@@ -35,17 +51,24 @@ interface BindingSpace extends Destroyable {
   executeBatch(sql: string): Promise<void>;
   query(sql: string, params: unknown[]): Promise<{ columns: string[]; rows: BindingValue[][] }>;
   putObject(content: ArrayBuffer): Promise<bigint>;
+  beginObject(): Promise<BindingObjectWriter>;
   readObject(id: bigint, start: bigint, end: bigint): Promise<ArrayBuffer>;
   objectLen(id: bigint): Promise<bigint>;
   deleteObject(id: bigint): Promise<void>;
   phraseKey(): Promise<ArrayBuffer>;
   changedElsewhere(): Promise<boolean>;
-  changeWords(words: number[]): Promise<void>;
+  isReadOnly(): Promise<boolean>;
+  changeWords(words: BindingNewWords): Promise<void>;
   forgetWords(words: number[]): Promise<boolean>;
   keepOnlyThis(): Promise<void>;
-  copyToNewVault(path: string): Promise<BindingVault>;
-  copyInto(vault: BindingVault): Promise<void>;
+  copyToNewVault(path: string, words: BindingNewWords | undefined): Promise<BindingVault>;
+  copyInto(vault: BindingVault, words: BindingNewWords | undefined): Promise<void>;
   lock(): Promise<void>;
+}
+
+interface BindingObjectWriter extends Destroyable {
+  write(bytes: ArrayBuffer): Promise<void>;
+  finish(): Promise<bigint>;
 }
 
 type BindingValue = { tag: string; inner?: { value: unknown } };
@@ -89,8 +112,13 @@ export function wrap(binding: Binding): Temple {
       return space ? new WrappedSpace(space) : null;
     }
 
-    async createSpace(words: number[], options?: { room?: number }) {
-      return new WrappedSpace(await run(() => this.inner.createSpace(valid(words), room(options))));
+    async salvage(words: number[]) {
+      const space = await run(() => this.inner.salvage(valid(words)));
+      return space ? new WrappedSpace(space) : null;
+    }
+
+    async createSpace(words: NewWords, options?: { room?: number }) {
+      return new WrappedSpace(await run(() => this.inner.createSpace(fresh(words), room(options))));
     }
 
     close() {
@@ -129,6 +157,10 @@ export function wrap(binding: Binding): Temple {
       return Number(await run(() => this.#space.putObject(buffer(content))));
     }
 
+    async writeObject() {
+      return new WrappedObjectWriter(await run(() => this.#space.beginObject()));
+    }
+
     async readObject(id: number, start = 0, end?: number) {
       const to = end === undefined ? END : whole(end, 'end');
       return new Uint8Array(await run(() => this.#space.readObject(whole(id, 'id', true), whole(start, 'start'), to)));
@@ -150,8 +182,12 @@ export function wrap(binding: Binding): Temple {
       return run(() => this.#space.changedElsewhere());
     }
 
-    async changeWords(words: number[]) {
-      return run(() => this.#space.changeWords(valid(words)));
+    isReadOnly() {
+      return run(() => this.#space.isReadOnly());
+    }
+
+    async changeWords(words: NewWords) {
+      return run(() => this.#space.changeWords(fresh(words)));
     }
 
     async forgetWords(words: number[]) {
@@ -162,13 +198,15 @@ export function wrap(binding: Binding): Temple {
       return run(() => this.#space.keepOnlyThis());
     }
 
-    async copyToNewVault(path: string) {
-      return new WrappedVault(await run(() => this.#space.copyToNewVault(path)));
+    async copyToNewVault(path: string, options?: { words?: NewWords }) {
+      const words = options?.words && fresh(options.words);
+      return new WrappedVault(await run(() => this.#space.copyToNewVault(path, words)));
     }
 
-    async copyInto(vault: Vault) {
+    async copyInto(vault: Vault, options?: { words?: NewWords }) {
       if (!(vault instanceof WrappedVault)) throw new TempleError('NotFound', 'not a vault of this Temple');
-      return run(() => this.#space.copyInto(vault.inner));
+      const words = options?.words && fresh(options.words);
+      return run(() => this.#space.copyInto(vault.inner, words));
     }
 
     /** Even when locking fails – another device opened the vault – the space is closed. Calls while it locks share that lock. */
@@ -189,21 +227,69 @@ export function wrap(binding: Binding): Temple {
     }
   }
 
+  class WrappedObjectWriter implements ObjectWriter {
+    #inner: BindingObjectWriter | null;
+
+    constructor(inner: BindingObjectWriter) {
+      this.#inner = inner;
+    }
+
+    /** The writer, until it finished – its Rust object is gone then. */
+    get #writer(): BindingObjectWriter {
+      if (!this.#inner) throw new TempleError('NoSuchObject', 'the object is finished');
+      return this.#inner;
+    }
+
+    write(bytes: Uint8Array) {
+      return run(() => this.#writer.write(buffer(bytes)));
+    }
+
+    async finish() {
+      const writer = this.#writer;
+      this.#inner = null;
+      try {
+        return Number(await run(() => writer.finish()));
+      } finally {
+        writer.uniffiDestroy?.();
+      }
+    }
+  }
+
   return {
     async generateWords() {
-      return binding.generateWords();
+      return new WrappedNewWords(binding.generateWords());
     },
     async wordsAreValid(words: number[]) {
       return indices(words) !== null && binding.wordsAreValid(words);
     },
-    async createVault(path: string, words: number[], options?: { room?: number }) {
-      const { vault, space } = await run(() => binding.createVault(path, valid(words), room(options)));
+    async createVault(path: string, words: NewWords, options?: { room?: number }) {
+      const { vault, space } = await run(() => binding.createVault(path, fresh(words), room(options)));
       return { vault: new WrappedVault(vault), space: new WrappedSpace(space) };
     },
-    async openVault(path: string) {
-      return new WrappedVault(await run(() => binding.openVault(path)));
+    async openVault(path: string, options?: { readOnly?: boolean }) {
+      return new WrappedVault(await run(() => binding.openVault(path, options?.readOnly ?? false)));
+    },
+    excludeFromBackup(path: string) {
+      return run(() => binding.excludeFromBackup(path));
     },
   };
+}
+
+/** Words from `generateWords`, kept in Rust: their indices are only for showing. */
+class WrappedNewWords implements NewWords {
+  readonly indices: number[];
+
+  constructor(readonly inner: BindingNewWords) {
+    this.indices = inner.indices();
+  }
+}
+
+/** New words as they cross into Rust – only those Temple made: typed or picked words never become a space. */
+function fresh(words: NewWords): BindingNewWords {
+  if (!(words instanceof WrappedNewWords)) {
+    throw new TempleError('InvalidWords', 'new words come from generateWords, never from the user');
+  }
+  return words.inner;
 }
 
 function room(options?: { room?: number }): bigint {

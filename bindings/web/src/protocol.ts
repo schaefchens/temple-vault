@@ -9,5 +9,5 @@ export type Reply = { id: number; value: unknown } | { id: number; error: { kind
 /** The worker can't go on: a panic poisons a wasm instance. */
 export type Fatal = { fatal: string };
 
-/** A vault or space in a message. */
-export type Ref = { vault: number } | { space: number };
+/** A vault, a space, an object being written or new words in a message – new words with their indices. */
+export type Ref = { vault: number } | { space: number } | { writer: number } | { newWords: number; indices?: number[] };

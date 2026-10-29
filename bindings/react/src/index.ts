@@ -2,7 +2,7 @@
 // after writes. They work with either platform's Temple, given through `TempleProvider`.
 
 import { createContext, createElement, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
-import { TempleError, type Row, type Space, type SqlValue, type Temple, type Vault } from '@schaefchens/temple';
+import { TempleError, type NewWords, type Row, type Space, type SqlValue, type Temple, type Vault } from '@schaefchens/temple';
 
 const TempleContext = createContext<Temple | null>(null);
 
@@ -26,14 +26,16 @@ export type VaultState =
   | { status: 'failed'; error: unknown };
 
 export type VaultHandle = VaultState & {
-  /** A new vault at the path with its first space, which opens. */
-  create(words: number[], options?: { room?: number }): Promise<void>;
+  /** A new vault at the path with its first space, which opens – under words from `generateWords`. */
+  create(words: NewWords, options?: { room?: number }): Promise<void>;
   /** Opens the space the words open; false if they open none. */
   unlock(words: number[]): Promise<boolean>;
   /** Quick unlock with a kept phrase key; false if it opens nothing. */
   unlockWithKey(key: Uint8Array): Promise<boolean>;
-  /** A new space for words that open none, which opens – once the user confirmed them. */
-  createSpace(words: number[], options?: { room?: number }): Promise<void>;
+  /** Opens what can still be read of a damaged space, read-only; false if the words open none. */
+  salvage(words: number[]): Promise<boolean>;
+  /** A new space under words from `generateWords`, which opens – for words that opened none, once the user confirmed. */
+  createSpace(words: NewWords, options?: { room?: number }): Promise<void>;
   /** Locks the open space, and any space a running call still opens; the state shows it locked even when locking failed. */
   lock(): Promise<void>;
 };
@@ -58,9 +60,11 @@ const releases = new Map<string, Promise<void>>();
 /**
  * The vault at `path` and its open space, if any: a vault opens one space at a time. The
  * space locks and the vault closes when the component unmounts or `path` changes – and a
- * space that opens after `lock` was called locks at once.
+ * space that opens after `lock` was called locks at once. `readOnly`: nothing is written to
+ * the vault, and its spaces open read-only.
  */
-export function useVault(path: string): VaultHandle {
+export function useVault(path: string, options?: { readOnly?: boolean }): VaultHandle {
+  const readOnly = options?.readOnly ?? false;
   const temple = useTemple();
   const [state, setState] = useState<VaultState>({ status: 'opening' });
   const session = useRef<Session>({ state, done: false, locks: 0, running: new Set(), show: setState });
@@ -89,7 +93,7 @@ export function useVault(path: string): VaultHandle {
     setState(current.state);
 
     const opened = previous
-      .then(() => (current.done ? null : temple.openVault(path)))
+      .then(() => (current.done ? null : temple.openVault(path, { readOnly })))
       .then(
         (vault) => vault && current.show({ status: 'locked', vault }),
         (error) => current.show(TempleError.is(error, 'NotFound') ? { status: 'missing' } : { status: 'failed', error }),
@@ -103,7 +107,7 @@ export function useVault(path: string): VaultHandle {
           release();
         });
     };
-  }, [temple, path]);
+  }, [temple, path, readOnly]);
 
   /** Runs one of this mount's calls, so that its end can wait for it. */
   const run = <T>(call: (mount: Session) => Promise<T>): Promise<T> => {
@@ -119,7 +123,7 @@ export function useVault(path: string): VaultHandle {
     throw new TempleError('NotFound', `no vault is open at ${path}`);
   };
   const create = useCallback(
-    (words: number[], options?: { room?: number }) =>
+    (words: NewWords, options?: { room?: number }) =>
       run(async (mount) => {
         const locks = mount.locks;
         const { vault, space } = await temple.createVault(path, words, options);
@@ -147,8 +151,18 @@ export function useVault(path: string): VaultHandle {
       }),
     [],
   );
+  const salvage = useCallback(
+    (words: number[]) =>
+      run(async (mount) => {
+        const [locks, opened] = [mount.locks, vault()];
+        const space = await opened.salvage(words);
+        if (space) await show(mount, locks, opened, space);
+        return space !== null;
+      }),
+    [],
+  );
   const createSpace = useCallback(
-    (words: number[], options?: { room?: number }) =>
+    (words: NewWords, options?: { room?: number }) =>
       run(async (mount) => {
         const [locks, opened] = [mount.locks, vault()];
         await show(mount, locks, opened, await opened.createSpace(words, options));
@@ -171,7 +185,7 @@ export function useVault(path: string): VaultHandle {
     [],
   );
 
-  return { ...state, create, unlock, unlockWithKey, createSpace, lock };
+  return { ...state, create, unlock, unlockWithKey, salvage, createSpace, lock };
 }
 
 /** A space a call opened: shown – or, if a lock was asked for meanwhile, locked at once. */

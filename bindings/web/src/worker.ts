@@ -1,7 +1,7 @@
 // Temple's worker: it hosts the wasm module – only a worker can open the sync access
 // handles a vault's file needs – and runs the page's calls on its vaults and spaces.
 
-import { TempleError, wrap, type Space, type Vault } from '@schaefchens/temple';
+import { TempleError, wrap, type NewWords, type ObjectWriter, type Space, type Vault } from '@schaefchens/temple';
 import { uniffiInitAsync } from './generated/index';
 import * as binding from './generated/temple';
 import type { Call, Close, Fatal, Reply } from './protocol';
@@ -9,7 +9,9 @@ import type { Call, Close, Fatal, Reply } from './protocol';
 const temple = uniffiInitAsync(new URL('./generated/temple_ffi.wasm', import.meta.url)).then(() => wrap(binding));
 const vaults = new Map<number, Vault>();
 const spaces = new Map<number, Space>();
-const known = new Map<Vault | Space, number>();
+const writers = new Map<number, ObjectWriter>();
+const newWords = new Map<number, NewWords>();
+const known = new Map<Vault | Space | ObjectWriter | NewWords, number>();
 let next = 1;
 
 self.onmessage = async ({ data }: MessageEvent<Call | Close>) => {
@@ -20,12 +22,12 @@ self.onmessage = async ({ data }: MessageEvent<Call | Close>) => {
   }
   const { id, target, method, args } = data;
   try {
-    const receiver = target === 0 ? await temple : (vaults.get(target) ?? spaces.get(target));
+    const receiver = target === 0 ? await temple : (vaults.get(target) ?? spaces.get(target) ?? writers.get(target));
     if (!receiver) throw new TempleError('Locked', 'this vault or space is gone');
     const call = (receiver as unknown as Record<string, (...args: unknown[]) => unknown>)[method];
-    // A space is closed once it has locked, even when locking failed.
+    // A space is closed once it has locked, even when locking failed; a writer once it finished.
     const value = await Promise.resolve(call.apply(receiver, args.map(resolve))).finally(() => {
-      if (method === 'lock') forget(target);
+      if (method === 'lock' || method === 'finish') forget(target);
     });
     const transfer = value instanceof Uint8Array ? [value.buffer as ArrayBuffer] : [];
     post({ id, value: refer(value) }, transfer);
@@ -47,26 +49,37 @@ function post(message: Reply | Fatal, transfer: Transferable[] = []) {
   self.postMessage(message, { transfer });
 }
 
-/** Vaults and spaces as numbers – the page holds them by those. */
+/** Vaults, spaces, writers and new words as numbers – the page holds them by those. */
 function refer(value: unknown): unknown {
   if (isTemple(value, 'unlock')) return { vault: remember(value as Vault, vaults) };
   if (isTemple(value, 'execute')) return { space: remember(value as Space, spaces) };
+  if (isTemple(value, 'finish')) return { writer: remember(value as ObjectWriter, writers) };
+  if (value && typeof value === 'object' && 'indices' in value && Array.isArray(value.indices)) {
+    return { newWords: remember(value as NewWords, newWords), indices: value.indices };
+  }
   if (value && typeof value === 'object' && 'vault' in value && 'space' in value) {
     return { vault: refer(value.vault), space: refer(value.space) };
   }
   return value;
 }
 
+/** What the page sent, with its numbers for vaults and new words – in options too – made the objects again. */
 function resolve(arg: unknown): unknown {
-  if (arg && typeof arg === 'object' && 'vault' in arg && typeof arg.vault === 'number') {
+  if (!arg || typeof arg !== 'object' || ArrayBuffer.isView(arg) || Array.isArray(arg)) return arg;
+  if ('vault' in arg && typeof arg.vault === 'number') {
     const vault = vaults.get(arg.vault);
     if (!vault) throw new TempleError('NotFound', 'that vault has closed');
     return vault;
   }
-  return arg;
+  if ('newWords' in arg && typeof arg.newWords === 'number') {
+    const words = newWords.get(arg.newWords);
+    if (!words) throw new TempleError('InvalidWords', 'those new words are gone – generate others');
+    return words;
+  }
+  return Object.fromEntries(Object.entries(arg).map(([key, value]) => [key, resolve(value)]));
 }
 
-function remember<T extends Vault | Space>(object: T, map: Map<number, T>): number {
+function remember<T extends Vault | Space | ObjectWriter | NewWords>(object: T, map: Map<number, T>): number {
   const known_ = known.get(object);
   if (known_ !== undefined) return known_;
   const handle = next++;
@@ -76,10 +89,12 @@ function remember<T extends Vault | Space>(object: T, map: Map<number, T>): numb
 }
 
 function forget(handle: number) {
-  const object = vaults.get(handle) ?? spaces.get(handle);
+  const object = vaults.get(handle) ?? spaces.get(handle) ?? writers.get(handle) ?? newWords.get(handle);
   if (object) known.delete(object);
   vaults.delete(handle);
   spaces.delete(handle);
+  writers.delete(handle);
+  newWords.delete(handle);
 }
 
 function isTemple(value: unknown, method: string): boolean {

@@ -1,7 +1,7 @@
 //! Vaults in real files.
 
 use super::{SMALL_NOISE, phrase};
-use crate::device::FileDevice;
+use crate::device::{Device, FileDevice};
 use crate::vault::{Setup, Vault};
 use crate::{Error, Space, ZONE};
 use std::fs;
@@ -9,15 +9,15 @@ use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
 fn create(path: &std::path::Path) -> (Vault, Space) {
-    Vault::create_at(path, SMALL_NOISE, |file| {
-        Space::create(file, file.claim(), phrase(0).1.duplicate(), Setup::default(), true)
+    Vault::create_at(path, SMALL_NOISE, |file, claim| {
+        Space::create(file, Some(claim), phrase(0).1.duplicate(), Setup::default(), true)
     })
     .unwrap()
 }
 
 fn open(path: &std::path::Path) -> Vault {
     let file = fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
-    Vault::open_on(Arc::new(FileDevice::new(file, path)), SMALL_NOISE).unwrap()
+    Vault::open_on(Arc::new(FileDevice::new(file, path)), SMALL_NOISE, false).unwrap()
 }
 
 #[test]
@@ -152,24 +152,118 @@ fn opening_a_file_that_isnt_a_vault_leaves_it_as_it_was() {
     assert!(fs::read(&path).unwrap() == original);
 }
 
+fn busy<T>(result: Result<T, Error>) -> bool {
+    matches!(result, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::ResourceBusy)
+}
+
 /// From the review: creating a vault removed `.<name>.part` unconditionally, and nothing kept
-/// a second process from writing beside the first. A vault's file is locked while open now:
-/// a creation still running elsewhere keeps its part, and a second opener is refused.
+/// a second process from writing beside the first. A vault's file is locked while a space is
+/// open now: a creation still running elsewhere keeps its part, and a second process opens
+/// no space meanwhile.
 #[test]
 fn a_vault_open_elsewhere_is_left_alone() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("reading");
     let partial = dir.path().join(".reading.temple-part");
-    let elsewhere = fs::File::create(&partial).unwrap();
-    crate::vault::hold(&elsewhere).unwrap();
-    let busy = |result: Result<Vault, Error>| matches!(result, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::ResourceBusy);
-    assert!(busy(Vault::create(&path, &phrase(0).0, Setup::default()).map(|(vault, _)| vault)));
+    let elsewhere = FileDevice::new(fs::File::create(&partial).unwrap(), &partial);
+    elsewhere.hold(false).unwrap();
+    assert!(busy(Vault::create(&path, &phrase(0).0, Setup::default())));
     assert!(partial.exists());
     drop(elsewhere);
 
     let (vault, space) = create(&path);
+    // Another process – a second file handle here – opens the vault, but no space while one
+    // is open; not even read-only.
+    let other = Vault::open(&path).unwrap();
+    assert!(busy(other.unlock_with_key(&phrase(0).1)));
+    assert!(busy(Vault::open_read_only(&path).unwrap().unlock_with_key(&phrase(0).1)));
     space.lock().unwrap();
-    assert!(busy(Vault::open(&path)));
+    let there = other.unlock_with_key(&phrase(0).1).unwrap().unwrap();
+    assert!(busy(vault.unlock_with_key(&phrase(0).1)));
+    there.lock().unwrap();
+    assert!(vault.unlock_with_key(&phrase(0).1).unwrap().is_some());
+}
+
+/// From this review: the file was locked for as long as the vault was open – on iOS, a vault
+/// in an app group's container would end an app suspended with it, while no space was open.
+/// The lock comes and goes with the open space.
+#[test]
+fn a_vault_without_an_open_space_holds_no_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reading");
+    let (vault, space) = create(&path);
+    let probe = || FileDevice::new(fs::File::open(&path).unwrap(), &path).hold(false);
+    assert!(probe().is_err());
+    space.lock().unwrap();
+    probe().unwrap();
+    let space = vault.unlock_with_key(&phrase(0).1).unwrap().unwrap();
+    assert!(probe().is_err());
+    drop(space);
+    probe().unwrap();
+}
+
+/// From this review: a vault on read-only storage couldn't be opened at all. Opened read-only,
+/// its spaces read – the log of one that didn't lock too – and nothing is written: not the
+/// opening marker, not a checkpoint as SQLite closes.
+#[test]
+fn a_read_only_vault_opens_and_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reading");
+    let (vault, space) = create(&path);
+    space.db().execute_batch("CREATE TABLE note (body TEXT); INSERT INTO note VALUES ('locked');").unwrap();
+    space.put_object(&b"an object"[..]).unwrap();
+    space.lock().unwrap();
+    let space = vault.unlock_with_key(&phrase(0).1).unwrap().unwrap();
+    space.db().execute("INSERT INTO note VALUES ('in the log')", []).unwrap();
+    // The vault as the app's end would leave it: the last commit only in the log.
+    let crashed = dir.path().join("crashed");
+    fs::copy(&path, &crashed).unwrap();
+    space.lock().unwrap();
     drop(vault);
-    assert!(Vault::open(&path).unwrap().unlock_with_key(&phrase(0).1).unwrap().is_some());
+    let path = crashed;
+
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_readonly(true);
+    fs::set_permissions(&path, permissions).unwrap();
+    assert!(Vault::open(&path).is_err());
+    let before = fs::read(&path).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+    let vault = Vault::open_read_only(&path).unwrap();
+    let space = vault.unlock_with_key(&phrase(0).1).unwrap().unwrap();
+    assert!(space.is_read_only());
+    let mut statement = space.db().prepare("SELECT body FROM note ORDER BY rowid").unwrap();
+    let notes: Vec<String> = statement.query_map([], |row| row.get(0)).unwrap().map(Result::unwrap).collect();
+    drop(statement);
+    assert_eq!(notes, ["locked", "in the log"]);
+    assert_eq!(space.read_object(1, 0..100).unwrap(), b"an object");
+    assert!(space.db().execute("INSERT INTO note VALUES ('refused')", []).is_err());
+    assert!(matches!(space.put_object(&b"x"[..]), Err(Error::ReadOnly)));
+    assert!(matches!(space.delete_object(1), Err(Error::ReadOnly)));
+    assert!(matches!(vault.create_space(&phrase(1).0, Setup::default()), Err(Error::ReadOnly)));
+    space.lock().unwrap();
+    assert!(vault.unlock(&phrase(1).0).unwrap().is_none());
+    drop(vault);
+    assert!(fs::read(&path).unwrap() == before);
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+}
+
+/// From this review: the iOS binding had no way to keep a vault out of backups.
+#[test]
+fn a_vault_can_be_left_out_of_backups() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("reading");
+    let (_vault, space) = create(&path);
+    space.lock().unwrap();
+    let marked = Vault::exclude_from_backup(&path).unwrap();
+    assert_eq!(marked, cfg!(target_vendor = "apple"));
+    #[cfg(target_vendor = "apple")]
+    {
+        // The extended attribute behind NSURLIsExcludedFromBackupKey.
+        let name = c"com.apple.metadata:com_apple_backup_excludeItem";
+        let file = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        let size = unsafe { libc::getxattr(file.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
+        assert!(size > 0, "no backup mark");
+    }
+    assert!(Vault::exclude_from_backup(dir.path().join("missing")).is_err());
 }

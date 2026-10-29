@@ -5,9 +5,9 @@
 //! byte layout: `docs/format.md`.
 //!
 //! ```no_run
-//! use temple_vault::{Setup, Vault, Words};
+//! use temple_vault::{NewWords, Setup, Vault};
 //!
-//! let words = Words::generate();
+//! let words = NewWords::generate();
 //! let (vault, space) = Vault::create("reading.vault", &words, Setup::default())?;
 //! space.db().execute("CREATE TABLE note (body TEXT)", [])?;
 //! space.lock()?;
@@ -37,12 +37,13 @@ mod words;
 #[cfg(test)]
 mod tests;
 
+pub use crypto::wipe_stack;
 pub use error::Error;
 pub use keys::PhraseKey;
 pub use rusqlite;
-pub use space::{ObjectId, Space};
+pub use space::{Interrupt, ObjectId, ObjectWriter, Space};
 pub use vault::{Setup, Vault};
-pub use words::Words;
+pub use words::{NewWords, Words};
 
 /// 1 MiB: vaults grow by whole zones.
 const ZONE: u64 = 1 << 20;

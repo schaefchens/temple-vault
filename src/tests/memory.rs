@@ -23,6 +23,8 @@ struct State {
     /// Every read since watching started: offset and length.
     reads: Option<Vec<(u64, usize)>>,
     replaced: bool,
+    /// Writes fail, as on a full disk.
+    full: bool,
 }
 
 impl Memory {
@@ -69,6 +71,11 @@ impl Memory {
     pub(crate) fn replace(&self) {
         self.state.lock().unwrap().replaced = true;
     }
+
+    /// From now on writes fail, as on a full disk.
+    pub(crate) fn fill_up(&self) {
+        self.state.lock().unwrap().full = true;
+    }
 }
 
 impl Device for Memory {
@@ -88,6 +95,9 @@ impl Device for Memory {
 
     fn write_at(&self, data: &[u8], offset: u64) -> io::Result<()> {
         let mut state = self.state.lock().unwrap();
+        if state.full {
+            return Err(io::ErrorKind::StorageFull.into());
+        }
         let start = offset as usize;
         let end = start + data.len();
         assert!(start <= state.bytes.len(), "a write leaves a hole: the file would be sparse");
