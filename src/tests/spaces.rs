@@ -927,3 +927,38 @@ fn an_io_error_is_explained() {
     let failed = space.db().query_row("SELECT nothing FROM t", [], |row| row.get::<_, i64>(0)).unwrap_err();
     assert!(matches!(space.explain(failed), Error::Database(_)));
 }
+
+/// From the stress test on a small disk: when a lock's checkpoint has to grow the database and
+/// the disk is full, the lock reported `Damaged` – a full disk read as corruption. The VFS had
+/// recorded the full disk, but closing the connection then read a page the full disk had left
+/// half-written and recorded that over it. The space isn't damaged: it is reported as
+/// `StorageFull`, and with room again it opens with everything, the log's commits included.
+/// (Not on wasm, whose SQLite checkpoints differently; the disk is the host's, not the app's.)
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+#[test]
+fn a_full_disk_while_a_lock_grows_the_database_is_not_damage() {
+    let (memory, vault, space) = new_vault();
+    space.db().execute_batch("CREATE TABLE kv (k INTEGER PRIMARY KEY, v BLOB)").unwrap();
+    // A small, checkpointed base, so the database reserves few blocks.
+    for k in 0..10i64 {
+        space.db().execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, vec![1u8; 200]]).unwrap();
+    }
+    space.lock().unwrap();
+    let space = unlock(&vault, 0).unwrap();
+    // Then far more than the reserve's headroom covers, so the next lock's checkpoint must grow
+    // the database rather than write into blocks it already holds.
+    for k in 10..6000i64 {
+        space.db().execute("INSERT INTO kv VALUES (?1, ?2)", rusqlite::params![k, vec![1u8; 3000]]).unwrap();
+    }
+    // No free blocks and no room to grow: the checkpoint fills the disk partway through.
+    space.store().fill_up();
+    memory.room_up_to(Some(memory.bytes().len() as u64));
+    let failed = space.lock().unwrap_err();
+    assert!(matches!(&failed, Error::Io(e) if e.kind() == io::ErrorKind::StorageFull), "{failed:?}");
+
+    // With room again the space opens, and holds every committed row.
+    memory.room_up_to(None);
+    let count: i64 =
+        unlock(&vault, 0).unwrap().db().query_row("SELECT count(*) FROM kv", [], |row| row.get(0)).unwrap();
+    assert_eq!(count, 6000);
+}

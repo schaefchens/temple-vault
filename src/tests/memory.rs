@@ -25,6 +25,8 @@ struct State {
     replaced: bool,
     /// Writes fail, as on a full disk.
     full: bool,
+    /// Writes past this length fail, as on a disk with that much room left.
+    room: Option<u64>,
 }
 
 impl Memory {
@@ -76,6 +78,12 @@ impl Memory {
     pub(crate) fn fill_up(&self) {
         self.state.lock().unwrap().full = true;
     }
+
+    /// From now on the file can't grow past `len` bytes, as on a disk with that much room
+    /// left; `None` lifts the limit.
+    pub(crate) fn room_up_to(&self, len: Option<u64>) {
+        self.state.lock().unwrap().room = len;
+    }
 }
 
 impl Device for Memory {
@@ -100,6 +108,9 @@ impl Device for Memory {
         }
         let start = offset as usize;
         let end = start + data.len();
+        if end > state.bytes.len() && state.room.is_some_and(|room| end as u64 > room) {
+            return Err(io::ErrorKind::StorageFull.into());
+        }
         assert!(start <= state.bytes.len(), "a write leaves a hole: the file would be sparse");
         if end > state.bytes.len() {
             state.bytes.resize(end, 0);

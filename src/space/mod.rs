@@ -347,12 +347,21 @@ impl Space {
         match checkpoint {
             Ok((0, frames, copied)) if frames == copied => {}
             outcome => {
-                // The log stays, with its key, for the next opening to replay.
+                // The log stays, with its key, for the next opening to replay. What the VFS
+                // recorded as the checkpoint ran – a full disk, or a page that failed its
+                // check – is taken here, before closing the connection runs more I/O that
+                // could record a later, downstream failure over it: a full disk that leaves a
+                // page half-written would otherwise be reported as a damaged space.
+                let recorded = self.store.lock().unwrap().failure.take();
                 self.store.lock().unwrap().read_only = true;
                 drop(db);
-                return Err(match outcome {
-                    Err(e) => self.sql_error(e),
-                    Ok(_) => Error::Damaged,
+                return Err(if self.file.stopped() {
+                    Error::ChangedElsewhere
+                } else {
+                    recorded.unwrap_or_else(|| match outcome {
+                        Err(e) => Error::Database(e),
+                        Ok(_) => Error::Damaged,
+                    })
                 });
             }
         }

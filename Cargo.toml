@@ -1,6 +1,6 @@
 [package]
 name = "temple-vault"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
 description = "Encrypted storage with plausible deniability: one file, any number of spaces, each opened by its own 12 words"

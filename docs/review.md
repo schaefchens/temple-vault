@@ -1,6 +1,49 @@
 # Temple reviews
 
-Four reviews, every finding with a **Fixed** or **Open** line: [2026-10-30, an audit](#2026-10-30-an-independent-audit-and-fixes), [2026-10-29, a recheck](#2026-10-29-a-recheck), [2026-10-29](#2026-10-29-production-readiness-and-crypto) and [2026-10-28](#2026-10-28-first-review). Severity: **high** – breaks a promise in normal use; **medium** – through a plausible mistake, crash or app bug; **low** – hardening and docs.
+Five reviews, every finding with a **Fixed** or **Open** line: [2026-10-30, a stress test](#2026-10-30-a-stress-test-and-a-fix), [2026-10-30, an audit](#2026-10-30-an-independent-audit-and-fixes), [2026-10-29, a recheck](#2026-10-29-a-recheck), [2026-10-29](#2026-10-29-production-readiness-and-crypto) and [2026-10-28](#2026-10-28-first-review). Severity: **high** – breaks a promise in normal use; **medium** – through a plausible mistake, crash or app bug; **low** – hardening and docs.
+
+## 2026-10-30: a stress test, and a fix
+
+Status: on top of 0.1.1. A stress test for lots of content – several spaces each holding gigabytes of
+objects and tens of MB of searchable text, filled, reopened, used over hundreds of sessions, and
+rebuilt ([src/tests/stress.rs](../src/tests/stress.rs)) – run on the Mac and the Android emulator. It
+found one fault, fixed with a test.
+
+### Low
+
+#### A full disk while a space locks was reported as damage
+
+- **Where:** `lock_database` (`src/space/mod.rs`). A lock checkpoints the log into the database,
+  growing it; on a full disk a page write fails, which the VFS records as `StorageFull`. But closing
+  the connection then reads a page the full disk left half-written and records `Damaged` over it, so
+  the lock returned `Damaged`.
+- **Seen:** the stress test on a small disk – the Android emulator, and a capped file system – where a
+  space's lock returned `Damaged` though the space was whole: given room again it reopened with every
+  committed row.
+- **Impact:** a full disk, an everyday condition, looked like a corrupt space – which could send an
+  app into salvage, or alarm its user, when all it needed was room. No data is lost: a failed lock
+  keeps the log and its key for the next opening to replay ([limits](design.md#limits)).
+- **Fixed:** the checkpoint failure takes what the VFS recorded – the full disk – before closing the
+  connection can record a later, downstream failure over it. `a_full_disk_while_a_lock_grows_the_database_is_not_damage`
+  (a small base, then more than the reserve's headroom, locked with no room) returns `Damaged` without
+  the fix. The stress test also stops cleanly on a full disk now, rather than panicking.
+
+### What ran
+
+- **The stress test** (`cargo test --release stress -- --ignored --nocapture`): 5 spaces, each 1,024
+  one-MiB chapters as objects and 64 MiB of verses with full-text search, filled, reopened, used over
+  300 sessions that alternate between them, and rebuilt. On the Mac: filling at 44–70 MiB/s and ~16,500
+  verses/s, a space's first lock ~3 s, the vault 8.40 GiB; reopening 117 ms by words (Argon2) and 8 ms
+  with the key; a rare word found in 0.2 ms, a 64 KiB range read in 0.17 ms, a whole chapter in 2.6 ms;
+  300 sessions left the file at 8.40 GiB (opening ~12 ms, flat from first to last); every space held
+  its chapters, verses and notes; the rebuild copied all five into a 7.26 GiB vault that opened whole;
+  peak memory 116 MiB.
+- **On the Android emulator** (Android 16, arm64), scaled to its disk – 3 spaces, 128 chapters, 16 MiB
+  of text, 80 sessions – the same end to end, at full speed and slowed to a cheap phone's pace (by
+  words then 0.5–0.95 s); the file stayed its size across the sessions; peak memory 76 MiB.
+- **The suite:** release and debug (106 tests), the regression test among them; clippy and rustfmt
+  clean. Scales with `TEMPLE_STRESS_SPACES`, `TEMPLE_STRESS_OBJECT_MB`, `TEMPLE_STRESS_TEXT_MB`,
+  `TEMPLE_STRESS_SESSIONS` and `TEMPLE_STRESS_REBUILD`.
 
 ## 2026-10-30: an independent audit, and fixes
 

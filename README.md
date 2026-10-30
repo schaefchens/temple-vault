@@ -6,7 +6,7 @@ Your app keeps its data – notes, settings, files, audio – in a **vault**: on
 
 That is **plausible deniability**: used as [design.md](docs/design.md#what-a-vault-reveals) describes, a vault gives no proof that it holds more than its user chose to show. What can still give a hidden space away – copies of a vault from different times, a forensic image of the phone – design.md measures, too.
 
-Temple runs inside your app on iOS and Android (React Native) and in the browser (a PWA), with one TypeScript API and React hooks for all three – and as a Rust library. It is open source (Apache 2.0) and young: v1 was built and tested in October 2026, and 0.1.1 is on npm and crates.io as a preview ([install](#install)) – but it hasn't had an external security audit yet.
+Temple runs inside your app on iOS and Android (React Native) and in the browser (a PWA), with one TypeScript API and React hooks for all three – and as a Rust library. It is open source (Apache 2.0) and young: v1 was built and tested in October 2026, and 0.1.2 is on npm and crates.io as a preview ([install](#install)) – but it hasn't had an external security audit yet.
 
 ### Made with AI
 
@@ -44,7 +44,7 @@ If your app only needs its data encrypted on the device, the phone's own encrypt
 
 ## Install
 
-Version 0.1.1 is a preview: the API may still change, and Temple waits for its external audit ([above](#made-with-ai)).
+Version 0.1.2 is a preview: the API may still change, and Temple waits for its external audit ([above](#made-with-ai)).
 
 ### React Native – iOS and Android
 
@@ -162,7 +162,7 @@ let space = vault.unlock(&words)?.expect("these words open a space");
 
 ## Status
 
-v1 built and tested, October 2026, its format final; 0.1.1 published as a preview, and a release proper waits for an external security audit. Temple stays small so it can be audited whole: about 3,200 lines of Rust, of which about 650 are the unsafe bridge to SQLite and a few dozen call the system for file locks and the backup mark. It was made with AI ([above](#made-with-ai)).
+v1 built and tested, October 2026, its format final; 0.1.2 published as a preview, and a release proper waits for an external security audit. Temple stays small so it can be audited whole: about 3,200 lines of Rust, of which about 650 are the unsafe bridge to SQLite and a few dozen call the system for file locks and the backup mark. It was made with AI ([above](#made-with-ai)).
 
 ## Repository
 
@@ -196,7 +196,8 @@ v1 built and tested, October 2026, its format final; 0.1.1 published as a previe
 - **Crashes:** a crash at any write keeps every commit made durable – while a space is used, created, grows, locks, turns its log over, changes words or keeps only itself. A crash keeps what the last sync made durable and any choice of the 4 KiB pieces written since. A long run (`cargo test --release soak -- --ignored`) tries 8,000 crashes and 2,000 copies over 40 workloads, half of them turning the log over every few commits.
 - **Copies** taken during a session open to a state the space had. Taken while it locks, they open to the newest state – read front to back always, in random order in 195 of 200 tries; the rest don't open. So do copies taken while the log turns over. Taken across commits and a lock or a turnover, a copy may hold pages from both sides, which then fail when read; across several turnovers most don't open ([limits](docs/design.md#limits)). Never does a copy open to a state the space didn't have.
 - **Deleted values** can't be read once a space locks or its log turns over, not even with its words – search terms in FTS5 included, however the table was made; no superblock copy keeps the log's key, not even decrypted unchecked. A crash while a shrinking database locks leaves none readable either. A lock that fails keeps the log for the next opening ([limits](docs/design.md#limits)).
-- **Long sessions** keep a vault its size: 5,000 small commits in one session, as an app saving a reading position makes them, add nothing – nor to a hidden space set up in one go. Free room scattered over 10,000 one-block holes keeps a space's records short.
+- **Long sessions** keep a vault its size: 5,000 small commits in one session, as an app saving a reading position makes them, add nothing – nor to a hidden space set up in one go.
+- **At scale** ([src/tests/stress.rs](src/tests/stress.rs), run by hand): several spaces each holding gigabytes of objects and tens of MB of searchable text, filled, reopened, used over hundreds of sessions and rebuilt. Five spaces came to 8.4 GiB on a Mac; with the key a space opened in 8 ms (117 ms from words), a 64 KiB read took 0.17 ms and a search a few ms; hundreds of sessions left the file its size, the rebuild reopened every space whole, and memory stayed at 116 MiB. The same, smaller, on the Android emulator. It turned up one fault – a full disk while a space locked, reported as damage rather than lack of room – now fixed ([review.md](docs/review.md)). Free room scattered over 10,000 one-block holes keeps a space's records short.
 - **Guards:** the app's SQL can't set pragmas that would break a space, write Temple's tables, attach its log, or write a file beside the vault. Opening a file that isn't a vault leaves it as it was; a second process opens no space while one is open, and without an open space the file holds no lock.
 - **Read-only and damage:** a vault opened read-only reads – a log that never locked too – and changes not a byte of its file, nor its time. A damaged space salvages read-only and writes nothing; damage to its tag table leaves nothing lost once it's copied into a new vault. A lock stops what runs on the space; an error beneath SQLite comes back as what it was.
 - **Unknown words** cost what known ones do: Argon2, then all four slots read and opened.

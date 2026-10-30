@@ -9,6 +9,8 @@ mod files;
 mod layout;
 mod memory;
 mod spaces;
+#[cfg(unix)]
+mod stress;
 
 use crate::crypto::{Key, NONCE, open_trailing};
 use crate::keys::PhraseKey;
