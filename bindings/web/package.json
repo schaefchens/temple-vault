@@ -1,6 +1,6 @@
 {
   "name": "@schaefchens/temple-web",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Temple for the web: vaults in the origin private file system, in a worker",
   "license": "Apache-2.0",
   "repository": {
@@ -30,7 +30,7 @@
     "build": "sh build.sh"
   },
   "dependencies": {
-    "@schaefchens/temple": "0.1.0",
+    "@schaefchens/temple": "0.1.1",
     "@ubjs/core": "0.31.0-6",
     "@ubjs/wasm": "0.31.0-6"
   },

@@ -20,16 +20,22 @@ export function App() {
 function Demo() {
   const vault = useVault(VAULT);
   const { lock } = vault;
+  // Cover the page synchronously when it is hidden, before the asynchronous lock finishes, so the
+  // app-switcher snapshot of an installed PWA shows the cover, not notes or fresh words.
+  const [covered, setCovered] = useState(false);
   useEffect(() => {
-    const hidden = () => {
-      if (document.visibilityState === 'hidden') void lock();
+    const onVisibility = () => {
+      const hidden = document.visibilityState === 'hidden';
+      setCovered(hidden);
+      if (hidden) void lock();
     };
-    document.addEventListener('visibilitychange', hidden);
-    return () => document.removeEventListener('visibilitychange', hidden);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
   }, [lock]);
 
   return (
     <main>
+      {covered && <div className="cover" aria-hidden="true" />}
       {vault.status === 'opening' && <p>Opening the vault…</p>}
       {vault.status === 'failed' && (
         <p data-testid="notice" className="error">
@@ -150,6 +156,7 @@ function Unlock({ vault }: { vault: VaultHandle }) {
         placeholder="12 words"
         autoCapitalize="none"
         autoCorrect="off"
+        autoComplete="off"
         spellCheck={false}
         rows={3}
       />

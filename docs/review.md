@@ -1,6 +1,68 @@
 # Temple reviews
 
-Three reviews, every finding with a **Fixed** or **Open** line: [2026-10-29, a recheck](#2026-10-29-a-recheck), [2026-10-29](#2026-10-29-production-readiness-and-crypto) and [2026-10-28](#2026-10-28-first-review). Severity: **high** – breaks a promise in normal use; **medium** – through a plausible mistake, crash or app bug; **low** – hardening and docs.
+Four reviews, every finding with a **Fixed** or **Open** line: [2026-10-30, an audit](#2026-10-30-an-independent-audit-and-fixes), [2026-10-29, a recheck](#2026-10-29-a-recheck), [2026-10-29](#2026-10-29-production-readiness-and-crypto) and [2026-10-28](#2026-10-28-first-review). Severity: **high** – breaks a promise in normal use; **medium** – through a plausible mistake, crash or app bug; **low** – hardening and docs.
+
+## 2026-10-30: an independent audit, and fixes
+
+Status: audited at commit e49de12 (release 0.1.0); fixed and released as 0.1.1. A full independent
+audit – the Rust core and crypto, the SQLite VFS, the bindings, the demos, dependencies and the
+release – with parallel reviewers, each finding rechecked against the code. The core is sound: no
+vulnerability reachable without the words, every earlier fix verified in place, the suite re-run (105
+native, 95 on wasm32). The findings below sit around the core; all are fixed in 0.1.1 but those
+marked **Open**. The full write-up is in [SECURITY_AUDIT_FULL_CLAUDE.md](../SECURITY_AUDIT_FULL_CLAUDE.md).
+
+### Medium
+
+#### 1. The published 0.1.0 lacked the recheck's fixes
+
+- The `v0.1.0` tag is 8a353dd; the recheck's fixes landed in e49de12, after 0.1.0 reached the
+  registries, so installing 0.1.0 got code the docs called fixed. **Fixed:** released as 0.1.1 from
+  the fixed tree.
+
+#### 2. A Buffer stored the wrong bytes
+
+- `buffer()` used `bytes.slice().buffer` (`bindings/js/src/wrap.ts`); a `Buffer` – React Native's
+  `buffer` polyfill – aliases `slice` to `subarray`, so the whole backing pool crossed into Rust, not
+  the view. **Seen** in Node: `Buffer.from("hello").slice().buffer` is 65,600 bytes, a sub-view is the
+  parent. **Fixed:** sliced by byte offset and length.
+
+#### 3. The web's SQLite had a writable `sqlite_dbpage`
+
+- The wasm build (SQLite 3.53.4) carries `sqlite_dbpage`, a raw-page write the table-name authorizer
+  doesn't see; the native build (3.54.1) doesn't. The write stays encrypted, but it can corrupt
+  Temple's own tables past the guard. **Fixed:** the connection runs in `SQLITE_DBCONFIG_DEFENSIVE`
+  (`src/space/mod.rs`); `raw_page_writes_are_refused`, a wasm test.
+
+### Low
+
+- **Out-of-range bigint parameters wrapped** mod 2^64 (`wrap.ts`). **Fixed:** refused as `InvalidArgument`.
+- **A sparse parameter array** reached the bindings with holes. **Fixed:** `Array.from`, holes as null.
+- **A closed vault reused** threw a raw binding error. **Fixed:** a `TempleError`.
+- **A crafted object row's size** could overflow the copy's room sum (`src/space/copy.rs`); reading
+  the row already failed its own checks, but the sum must not wrap first. **Fixed:** checked arithmetic.
+- **A FIFO at a vault's `.temple-part` name** could hang creation (`src/vault.rs`). **Fixed:** `O_NONBLOCK`.
+- **The demos.** The React Native cover unmounted the screen, so its fresh words changed on any
+  interruption – a space the user couldn't open, or a word change to words they never saw
+  (`examples/react-native/App.tsx`). **Fixed:** the cover overlays, keeping the screen mounted. The web
+  demo had no synchronous cover on hide and no Content-Security-Policy (`examples/web`). **Fixed:** a
+  cover, and a strict CSP in the build. Word fields turn off autofill on both.
+
+### Open
+
+- **The lock-ahead window:** a call that starts in the instant around a lock's interrupt can run to
+  the end before the lock (`bindings/ffi/src/lib.rs`), as before review.md 2026-10-29 #2 – a lock then
+  waits one call. A sticky flag would close it, but the public `interrupt` must stay clearable, so it
+  needs care; low impact. **Open.**
+- **CI and provenance:** no CI compiles the Apple- or Android-only Rust, and the shipped native/wasm
+  binaries have no provenance or published checksums. **Open.**
+- **Maintainer's call:** `overflow-checks` in the shipped release profile; a declared MSRV;
+  `FLAG_SECURE`/screen-capture on Android; explicit Android device-transfer backup rules. **Open.**
+
+### What ran
+
+The Rust suite in release (105) and on wasm32 (95, with the new raw-page test); clippy and rustfmt
+clean; the crate packaged (`cargo publish --dry-run`); the TypeScript type-checked; the wasm, iOS and
+Android artifacts rebuilt from the fixed source for 0.1.1.
 
 ## 2026-10-29: a recheck
 

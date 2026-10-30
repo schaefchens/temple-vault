@@ -503,5 +503,9 @@ fn connect(name: &str, how: Open, store: &Arc<Mutex<Store>>) -> Result<Connectio
     // After wal_autocheckpoint, which replaces the hook.
     vfs::turn_over_log(&db, store);
     vfs::guard_tables(&db, store);
+    // Defensive mode: the app's SQL can't write raw pages (`sqlite_dbpage`, present in the web
+    // build) or the schema (`writable_schema`), which the table-name authorizer doesn't see – a
+    // way to corrupt Temple's own tables past the guard. Temple's own setup above runs first.
+    db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     Ok(db)
 }

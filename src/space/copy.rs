@@ -2,7 +2,7 @@
 
 use super::objects::ObjectId;
 use super::runs;
-use super::store::{PAYLOAD, Store};
+use super::store::{PAYLOAD, Store, too_large};
 use super::{Access, Open, Space, connect, zones_for};
 use crate::crypto::{Key, TAG, wiping_stack};
 use crate::keys::PhraseKey;
@@ -71,10 +71,18 @@ impl Space {
         file.take_over()?;
         let objects = self.sql(objects_with_sizes(self.db()))?;
         let pages: i64 = self.sql(self.db().query_row("PRAGMA page_count", [], |row| row.get(0)))?;
-        // Room in blocks: the database's pages and its tag table, every object's blocks.
+        // Room in blocks: the database's pages and its tag table, every object's blocks. Checked
+        // throughout, so a crafted object row's huge size can't overflow into an under-allocation
+        // (reading it would fail its own checks, but the sum must not wrap first).
         let pages = pages as u64;
-        let objects_blocks: u64 = objects.iter().map(|&(_, size)| size.div_ceil(PAYLOAD as u64)).sum();
-        let zones = zones_for(pages + (pages * TAG as u64).div_ceil(PAYLOAD as u64) + objects_blocks)?;
+        let blocks = objects
+            .iter()
+            .try_fold((pages * TAG as u64).div_ceil(PAYLOAD as u64), |sum, &(_, size)| {
+                sum.checked_add(size.div_ceil(PAYLOAD as u64))
+            })
+            .and_then(|sum| sum.checked_add(pages))
+            .ok_or_else(too_large)?;
+        let zones = zones_for(blocks)?;
         let first_zone = file.append_noise(zones)?;
         if first {
             file.append_noise((file.noise.reserve)())?;

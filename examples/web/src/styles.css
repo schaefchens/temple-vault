@@ -102,3 +102,11 @@ button:active {
 .check {
   white-space: pre-wrap;
 }
+
+/* Covers the page while it is hidden, so a backgrounded PWA snapshot shows nothing. */
+.cover {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: var(--accent);
+}

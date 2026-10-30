@@ -1,6 +1,6 @@
 {
   "name": "@schaefchens/temple-react-native",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Temple for React Native on iOS and Android",
   "license": "Apache-2.0",
   "repository": {
@@ -33,7 +33,7 @@
     "build:ios": "ubrn build jsi2 ios --and-generate --release"
   },
   "dependencies": {
-    "@schaefchens/temple": "0.1.0",
+    "@schaefchens/temple": "0.1.1",
     "@ubjs/core": "0.31.0-6"
   },
   "peerDependencies": {

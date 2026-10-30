@@ -61,26 +61,38 @@ function Demo() {
     if (opened) temple.excludeFromBackup(VAULT).catch((e) => console.warn(message(e)));
   }, [opened]);
 
-  if (!active) return <View style={styles.cover} />;
-  switch (vault.status) {
-    case 'opening':
-      return <Busy label="Opening the vault…" />;
-    case 'failed':
-      return <Text style={styles.error}>{message(vault.error)}</Text>;
-    case 'missing':
-      return (
-        <FreshWords
-          title="A new vault"
-          action="Create vault"
-          busy="Creating the vault – writing its noise…"
-          onConfirm={(words) => vault.create(words)}
-        />
-      );
-    case 'locked':
-      return <Unlock vault={vault} />;
-    case 'open':
-      return <Notes space={vault.space} lock={vault.lock} />;
-  }
+  const content = () => {
+    switch (vault.status) {
+      case 'opening':
+        return <Busy label="Opening the vault…" />;
+      case 'failed':
+        return <Text style={styles.error}>{message(vault.error)}</Text>;
+      case 'missing':
+        return (
+          <FreshWords
+            title="A new vault"
+            action="Create vault"
+            busy="Creating the vault – writing its noise…"
+            onConfirm={(words) => vault.create(words)}
+          />
+        );
+      case 'locked':
+        return <Unlock vault={vault} />;
+      case 'open':
+        return <Notes space={vault.space} lock={vault.lock} />;
+    }
+  };
+
+  // The cover overlays the content without unmounting it: the screen's snapshot shows only the cover
+  // while the app is inactive, and a FreshWords screen keeps the words it showed – unmounting it
+  // would generate new ones, so a user who wrote the first set down could create a space they can't
+  // open, or change words to a set they never saw.
+  return (
+    <View style={styles.fill}>
+      {content()}
+      {!active && <View style={[StyleSheet.absoluteFill, styles.cover]} />}
+    </View>
+  );
 }
 
 /** Fresh words to write down, and what they're for. */
@@ -178,6 +190,10 @@ function Unlock({ vault }: { vault: VaultHandle }) {
         placeholder="12 words"
         autoCapitalize="none"
         autoCorrect={false}
+        autoComplete="off"
+        importantForAutofill="no"
+        textContentType="none"
+        spellCheck={false}
         multiline
         submitBehavior="blurAndSubmit"
         returnKeyType="go"
@@ -486,6 +502,7 @@ function message(error: unknown): string {
 
 const styles = StyleSheet.create({
   screen: { flex: 1 },
+  fill: { flex: 1 },
   cover: { flex: 1, backgroundColor: '#2f6fde' },
   card: { padding: 16, gap: 12 },
   row: { flexDirection: 'row', alignItems: 'center', gap: 8 },

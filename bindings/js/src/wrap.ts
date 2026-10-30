@@ -90,7 +90,12 @@ export function wrap(binding: Binding): Temple {
   const lower = (value: SqlValue): unknown => {
     const { Value } = binding;
     if (value === null || value === undefined) return new Value.Null();
-    if (typeof value === 'bigint') return new Value.Integer({ value });
+    if (typeof value === 'bigint') {
+      if (value < -(2n ** 63n) || value >= 2n ** 63n) {
+        throw new TempleError('InvalidArgument', `an integer parameter is outside SQLite's 64-bit range: ${value}`);
+      }
+      return new Value.Integer({ value });
+    }
     if (typeof value === 'number') {
       return Number.isSafeInteger(value) ? new Value.Integer({ value: BigInt(value) }) : new Value.Real({ value });
     }
@@ -100,7 +105,17 @@ export function wrap(binding: Binding): Temple {
   };
 
   class WrappedVault implements Vault {
-    constructor(readonly inner: BindingVault) {}
+    #inner: BindingVault | null;
+
+    constructor(inner: BindingVault) {
+      this.#inner = inner;
+    }
+
+    /** The open vault; once closed, calls fail as a TempleError rather than a raw binding error. */
+    get inner(): BindingVault {
+      if (!this.#inner) throw new TempleError('NotFound', 'the vault is closed');
+      return this.#inner;
+    }
 
     async unlock(words: number[]) {
       const space = await run(() => this.inner.unlock(valid(words)));
@@ -122,7 +137,8 @@ export function wrap(binding: Binding): Temple {
     }
 
     close() {
-      this.inner.uniffiDestroy?.();
+      this.#inner?.uniffiDestroy?.();
+      this.#inner = null;
     }
   }
 
@@ -141,7 +157,7 @@ export function wrap(binding: Binding): Temple {
     }
 
     async execute(sql: string, params: SqlValue[] = []) {
-      return Number(await run(() => this.#space.execute(sql, params.map(lower))));
+      return Number(await run(() => this.#space.execute(sql, Array.from(params, lower))));
     }
 
     executeBatch(sql: string) {
@@ -149,7 +165,7 @@ export function wrap(binding: Binding): Temple {
     }
 
     async query<T extends Row = Row>(sql: string, params: SqlValue[] = []) {
-      const { columns, rows } = await run(() => this.#space.query(sql, params.map(lower)));
+      const { columns, rows } = await run(() => this.#space.query(sql, Array.from(params, lower)));
       return rows.map((row) => Object.fromEntries(columns.map((column, i) => [column, lift(row[i])])) as T);
     }
 
@@ -321,9 +337,13 @@ function whole(value: number, what: string, signed = false): bigint {
   return BigInt(value);
 }
 
-/** The bytes a view covers, as their own ArrayBuffer – which crosses into Rust. */
+/**
+ * The bytes a view covers, as their own ArrayBuffer – which crosses into Rust. Sliced by offset and
+ * length, never via `.slice()`: a `Buffer` (Node, and the `buffer` polyfill React Native apps use)
+ * aliases `slice` to `subarray`, so `.slice().buffer` would be the whole backing pool, not the view.
+ */
 function buffer(bytes: Uint8Array): ArrayBuffer {
-  return bytes.slice().buffer as ArrayBuffer;
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
 function lift(value: BindingValue | undefined): SqlValue {

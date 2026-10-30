@@ -17,6 +17,8 @@ use crate::{BLOCK, Error, ZONE};
 use std::fs::{self, OpenOptions};
 use std::io;
 #[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -73,8 +75,9 @@ impl Vault {
         }
         let partial = path.with_file_name(format!(".{}{PART}", name.to_string_lossy()));
         // Left by a creation a crash interrupted – never a vault, as it never got its name –
-        // unless another process is still writing it.
-        match OpenOptions::new().write(true).open(&partial) {
+        // unless another process is still writing it. O_NONBLOCK so a FIFO planted at the name
+        // can't hang the open (it fails instead); a regular file is unaffected.
+        match OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&partial) {
             Ok(left) => {
                 FileDevice::new(left, &partial).hold(false)?;
                 fs::remove_file(&partial)?;

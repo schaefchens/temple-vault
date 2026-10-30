@@ -225,6 +225,20 @@ fn pragmas_that_would_break_the_space_are_refused() {
     assert_eq!(check, "ok");
 }
 
+/// From the audit: the web's SQLite carries a writable `sqlite_dbpage` vtable, a raw-page write the
+/// table-name authorizer wouldn't catch. Defensive mode refuses it. Native SQLite has no such
+/// vtable, so this only matters – and only runs – on wasm.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+#[test]
+fn raw_page_writes_are_refused() {
+    let (_memory, _vault, space) = new_vault();
+    note(&space, "x");
+    let refused = space.db().execute("UPDATE sqlite_dbpage SET data = zeroblob(4096) WHERE pgno = 1", []);
+    assert!(refused.is_err(), "a raw page write should be refused under defensive mode");
+    // The space still works.
+    assert_eq!(notes(&space), ["x"]);
+}
+
 #[test]
 fn new_words_move_the_space() {
     let (memory, vault, mut space) = new_vault();
