@@ -103,6 +103,8 @@ mkdir -p ../temple-packages
 npm pack -w @schaefchens/temple -w @schaefchens/temple-react-native -w @schaefchens/temple-web -w @schaefchens/temple-react --pack-destination ../temple-packages
 ```
 
+`npm run clean` frees the disk of what builds and tests left – the fuzzer's corpus and findings stay; `-- --all` also removes `node_modules`, `-- --devices` Temple's own simulators and emulators, `-- -n` only lists.
+
 ## Use
 
 The same on React Native and the web:
@@ -178,6 +180,7 @@ v1 built and tested, October 2026, its format final; 0.1.2 published as a previe
 | [tools/test_on_devices.sh](tools/test_on_devices.sh) | The tests on an Android emulator or phone and on the iOS simulator |
 | [tools/test_on_wasm.sh](tools/test_on_wasm.sh) | The tests on wasm32, in Node: 32-bit, one thread, the browser's clock and random source |
 | [tools/argon2_on_android.sh](tools/argon2_on_android.sh) | How long the phrase key takes on an Android phone over USB |
+| [tools/clean.sh](tools/clean.sh) | Frees the disk of what builds and tests left: `npm run clean` |
 | [spikes/storage](spikes/storage) | The storage spike's code: `cargo run --release` |
 | [bindings/ffi](bindings/ffi) | Temple's API for TypeScript through UniFFI, which uniffi-bindgen-react-native builds for React Native and the web |
 | [bindings/js](bindings/js) | `@schaefchens/temple`: the TypeScript API both platforms share, BIP-39's English wordlist, and the self-test |

@@ -9,6 +9,9 @@
     "examples/react-native",
     "examples/web"
   ],
+  "scripts": {
+    "clean": "sh tools/clean.sh"
+  },
   "overrides": {
     "react": "19.3.0",
     "react-dom": "19.3.0"
