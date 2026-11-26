@@ -16,6 +16,13 @@ zeroize = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 futures-channel = "0.3"
+# The handles native code reads with.
+getrandom = "0.4"
+
+# On Android: TempleReader's native methods, for Java and Kotlin. Only 0.3.0 is declarations
+# alone; later versions pull in a proc macro.
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "=0.3.0"
 
 # On iOS: background time for a lock, so that the app isn't suspended halfway.
 [target.'cfg(target_os = "ios")'.dependencies]

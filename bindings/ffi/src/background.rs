@@ -1,7 +1,7 @@
 //! Off the JS thread: natively, calls run on Temple's own thread, one after another in the
-//! order they came – a lock first – and the stack they used is wiped after each. wasm has no
-//! threads, so they run at once – the web keeps them off its main thread by hosting the whole
-//! module in a worker.
+//! order they came – a lock first, the app's native reads among the rest – and the stack they
+//! used is wiped after each. wasm has no threads, so they run at once – the web keeps them off
+//! its main thread by hosting the whole module in a worker.
 
 use crate::TempleError;
 
@@ -31,6 +31,40 @@ async fn queued<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, TempleError> + Send + 'static,
     first: bool,
 ) -> Result<T, TempleError> {
+    let (done, result) = futures_channel::oneshot::channel();
+    push(
+        Box::new(move || {
+            let _ = done.send(work());
+        }),
+        first,
+    );
+    result.await.map_err(|_| panicked())?
+}
+
+/// For the app's native code, on a thread of its own: waits its turn behind the calls already
+/// queued, then for the work.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, TempleError> + Send + 'static,
+) -> Result<T, TempleError> {
+    let (done, result) = std::sync::mpsc::sync_channel(1);
+    push(
+        Box::new(move || {
+            let _ = done.send(work());
+        }),
+        false,
+    );
+    result.recv().map_err(|_| panicked())?
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn panicked() -> TempleError {
+    TempleError::Io("Temple panicked".into())
+}
+
+/// Queues a job for Temple's thread – at the front for a lock.
+#[cfg(not(target_arch = "wasm32"))]
+fn push(job: Box<dyn FnOnce() + Send>, first: bool) {
     use std::collections::VecDeque;
     use std::sync::{Condvar, LazyLock, Mutex, PoisonError};
 
@@ -63,16 +97,11 @@ async fn queued<T: Send + 'static>(
         queue
     });
 
-    let (done, result) = futures_channel::oneshot::channel();
-    let job: Job = Box::new(move || {
-        let _ = done.send(work());
-    });
     {
         let mut jobs = QUEUE.jobs.lock().unwrap_or_else(PoisonError::into_inner);
         if first { jobs.push_front(job) } else { jobs.push_back(job) }
     }
     QUEUE.waiting.notify_one();
-    result.await.map_err(|_| TempleError::Io("Temple panicked".into()))?
 }
 
 #[cfg(target_arch = "wasm32")]

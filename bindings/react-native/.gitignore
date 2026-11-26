@@ -1,6 +1,10 @@
-# Built by ubrn from ../ffi: npm run build:ios, npm run build:android
+# Built by ubrn from ../ffi: npm run build:ios, npm run build:android. TempleReader and the
+# podspec are Temple's own.
 src/generated/
 src/index.tsx
-ios/
-android/
-TempleReactNative.podspec
+ios/*.xcframework
+android/build.gradle
+android/src/main/AndroidManifest.xml
+android/src/main/java/de/schaefchens/temple/TempleReactNativePackage.java
+android/src/main/jniLibs/
+android/build/

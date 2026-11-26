@@ -132,6 +132,19 @@ export interface Space {
   /** Locks the space: deleted values become unreadable, keys are wiped. It doesn't wait: on iOS and Android, work still running on the space fails as "Interrupted". */
   lock(): Promise<void>;
   isLocked(): Promise<boolean>;
+  /**
+   * iOS and Android: a handle for the app's own native code – a media player, say – to read this space's objects with,
+   * from any thread, the bytes never passing through JavaScript: `TempleReader` in Swift and Kotlin. Not on the web.
+   */
+  nativeReader?(): Promise<NativeReader>;
+}
+
+/** A handle native code reads a space's objects with; its reads fail as "Locked" once the space locks or it's released. */
+export interface NativeReader {
+  /** For the app's native module: `TempleReader(handle)`. */
+  readonly handle: string;
+  /** Gives the handle up. */
+  release(): void;
 }
 
 /** An object written piece by piece. One never finished ends as its space locks, and leaves nothing behind once it opens again. */

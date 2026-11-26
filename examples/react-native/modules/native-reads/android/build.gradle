@@ -1,0 +1,20 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'de.schaefchens.temple.demo'
+version = '1.0.0'
+
+android {
+  namespace "de.schaefchens.temple.demo.nativereads"
+  defaultConfig {
+    versionCode 1
+    versionName '1.0.0'
+  }
+}
+
+dependencies {
+  // TempleReader: Temple's React Native package, as autolinking names it.
+  implementation project(':schaefchens_temple-react-native')
+}

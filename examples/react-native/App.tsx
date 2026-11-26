@@ -1,7 +1,7 @@
 // Notes on Temple: one vault in the app's documents, spaces opened by 12 words, notes in each
 // space's database with full-text search, files as objects. Leaving the app locks the space,
 // and a cover hides it while the app isn't active. The link temple-demo://self-test offers
-// Temple's self-test on this device instead.
+// Temple's self-test on this device instead – with the demo's own native code reading, too.
 
 import { TempleProvider, changed, useExecute, useQuery, useVault, type VaultHandle } from '@schaefchens/temple-react';
 import { TempleError, temple, type NewWords, type Space } from '@schaefchens/temple-react-native';
@@ -13,6 +13,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, AppState, Linking, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
+import { nativeReads } from './modules/native-reads';
 
 const VAULT = documentPath('demo.vault');
 /** The phrase key for quick unlock, behind the device's biometrics or passcode. */
@@ -397,7 +398,8 @@ function SelfTestRun() {
         if (file.exists) file.delete();
       },
     };
-    void selfTest(temple, files, (check) => setChecks((all) => [...all, check])).finally(() => setDone(true));
+    const report = (check: Check) => setChecks((all) => [...all, check]);
+    void selfTest(temple, files, report, nativeReads).finally(() => setDone(true));
   }, []);
   const failed = checks.filter((check) => !check.ok).length;
   return (

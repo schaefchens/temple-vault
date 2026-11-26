@@ -7,4 +7,4 @@ npm install @schaefchens/temple-react-native @schaefchens/temple @ubjs/react-nat
 cd ios && pod install    # with Expo: npx expo prebuild
 ```
 
-`@ubjs/react-native` loads Temple's native library and must be a direct dependency of the app. For React Native's New Architecture, not Expo Go; the library is built for 64-bit phones, the iOS simulator and the Android emulator, Android from API level 24. How to use it: [Use](https://github.com/schaefchens/temple-vault#use); React hooks: `@schaefchens/temple-react`.
+`@ubjs/react-native` loads Temple's native library and must be a direct dependency of the app. For React Native's New Architecture, not Expo Go; the library is built for 64-bit phones, the iOS simulator and the Android emulator, Android from API level 24. How to use it: [Use](https://github.com/schaefchens/temple-vault#use); React hooks: `@schaefchens/temple-react`. The app's own native code reads a space's objects through `TempleReader`, in Swift and Kotlin: [From native code](https://github.com/schaefchens/temple-vault#from-native-code).

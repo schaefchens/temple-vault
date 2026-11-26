@@ -13,3 +13,6 @@ jsi2:
 # The generated entry, which src/temple.ts wraps: the package's own entry stays ours.
 turboModule:
   entrypoint: src/index.tsx
+# Temple's own: it compiles TempleReader.
+noOverwrite:
+  - TempleReactNative.podspec

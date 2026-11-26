@@ -10,6 +10,8 @@ use temple_vault::rusqlite::{self, Connection, ToSql, params_from_iter};
 use zeroize::Zeroizing;
 
 mod background;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod native;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
@@ -422,6 +424,9 @@ impl Space {
     pub async fn lock(self: Arc<Self>) -> Result<(), TempleError> {
         self.interrupt.interrupt();
         background::run_first(move || {
+            // Native code reads no more: its handles go first.
+            #[cfg(not(target_arch = "wasm32"))]
+            native::forget(&self);
             // Objects not finished end here: their keys and the pieces they hold are wiped now,
             // not once the app's garbage collector gets to their writers.
             for writer in self.writers().drain(..).filter_map(|writer| writer.upgrade()) {
@@ -528,7 +533,7 @@ mod tests {
     use std::task::{Context, Poll, Wake, Waker};
 
     /// Runs a call to its end, this thread waiting while Temple's works.
-    fn wait<T>(call: impl Future<Output = T>) -> T {
+    pub(crate) fn wait<T>(call: impl Future<Output = T>) -> T {
         struct Unpark(std::thread::Thread);
         impl Wake for Unpark {
             fn wake(self: Arc<Self>) {

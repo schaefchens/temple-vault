@@ -1,3 +1,5 @@
 .expo/
-ios/
-android/
+# Expo's prebuild makes these; modules/*/ios and android are the demo's own.
+/ios/
+/android/
+modules/*/android/build/

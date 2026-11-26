@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["NativeReadsModule"]
+  },
+  "android": {
+    "modules": ["de.schaefchens.temple.demo.nativereads.NativeReadsModule"]
+  }
+}

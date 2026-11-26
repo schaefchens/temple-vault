@@ -13,10 +13,25 @@ export type Files = {
 };
 
 /**
- * Runs the checks one after another, reporting each as it ends. Makes two vaults with the
- * real reserve of noise – some hundred megabytes each – and deletes them at the end.
+ * The app's native code reading with a handle from `Space.nativeReader` – on iOS and Android, a native module of the app's
+ * that uses TempleReader. It fails as a TempleError of the kind native code got.
  */
-export async function selfTest(temple: Temple, files: Files, report: (check: Check) => void = () => {}): Promise<Check[]> {
+export type NativeReads = {
+  objectLength(handle: string, id: number): Promise<number>;
+  readObject(handle: string, id: number, start: number, end: number): Promise<Uint8Array>;
+};
+
+/**
+ * Runs the checks one after another, reporting each as it ends. Makes two vaults with the
+ * real reserve of noise – some hundred megabytes each – and deletes them at the end. With
+ * `native`, native code's reads are checked, too.
+ */
+export async function selfTest(
+  temple: Temple,
+  files: Files,
+  report: (check: Check) => void = () => {},
+  native?: NativeReads,
+): Promise<Check[]> {
   const checks: Check[] = [];
   const check = async (name: string, run: () => Promise<void>) => {
     const start = Date.now();
@@ -129,6 +144,40 @@ export async function selfTest(temple: Temple, files: Files, report: (check: Che
     await expectError(() => writer.finish(), 'NoSuchObject');
     await space.deleteObject(id);
   });
+
+  if (native) {
+    await check('native code reads objects while JS uses the space; refused once deleted, given up or locked', async () => {
+      assert(space.nativeReader, 'spaces have nativeReader here');
+      const bytes = pattern(300_000);
+      const id = await space.putObject(bytes);
+      const reader = await space.nativeReader();
+      assert((await native.objectLength(reader.handle, id)) === bytes.length, 'its length');
+      // All at once: native reads – each from several threads – among JavaScript's calls.
+      const [whole, middle, tail, past, , js] = await Promise.all([
+        native.readObject(reader.handle, id, 0, bytes.length),
+        native.readObject(reader.handle, id, 70_000, 200_001),
+        native.readObject(reader.handle, id, bytes.length - 100, bytes.length + 100),
+        native.readObject(reader.handle, id, bytes.length + 10, bytes.length + 1_000),
+        space.query('SELECT count(*) FROM note'),
+        space.readObject(id),
+      ]);
+      assert(equal(js, bytes), 'readObject reads it');
+      assert(equal(whole, js), 'the whole object, as readObject reads it');
+      assert(equal(middle, await space.readObject(id, 70_000, 200_001)), 'a range in the middle');
+      assert(equal(tail, bytes.subarray(bytes.length - 100)), 'a range past its end: up to its end');
+      assert(past.length === 0, 'a range beyond its end: nothing');
+      const released = await space.nativeReader();
+      released.release();
+      await expectError(() => native.objectLength(released.handle, id), 'Locked');
+      await space.deleteObject(id);
+      await expectError(() => native.readObject(reader.handle, id, 0, 10), 'NoSuchObject');
+      const other = await space.putObject(bytes.subarray(0, 1000));
+      await space.lock();
+      await expectError(() => native.readObject(reader.handle, other, 0, 10), 'Locked');
+      await expectError(() => native.objectLength(reader.handle, other), 'Locked');
+      reader.release();
+    });
+  }
 
   await check('a locked space refuses every call', async () => {
     await space.lock();

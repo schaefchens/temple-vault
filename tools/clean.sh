@@ -31,7 +31,10 @@ done
 builds='target bindings/ffi/target fuzz/target spikes/*/target
 bindings/*/dist bindings/web/src/generated
 bindings/react-native/src/generated bindings/react-native/src/index.tsx
-bindings/react-native/ios bindings/react-native/android bindings/react-native/TempleReactNative.podspec
+bindings/react-native/ios/*.xcframework bindings/react-native/android/src/main/jniLibs
+bindings/react-native/android/build.gradle bindings/react-native/android/src/main/AndroidManifest.xml
+bindings/react-native/android/src/main/java/de/schaefchens/temple/TempleReactNativePackage.java
+bindings/react-native/android/build examples/react-native/modules/*/android/build
 examples/react-native/ios examples/react-native/android examples/react-native/.expo examples/web/dist'
 
 leftovers='examples/web/test-results examples/web/playwright-report fuzz/coverage'

@@ -5,6 +5,7 @@
 import {
   TempleError,
   type ErrorKind,
+  type NativeReader,
   type NewWords,
   type ObjectWriter,
   type Row,
@@ -21,6 +22,8 @@ export interface Binding {
   createVault(path: string, words: BindingNewWords, room: bigint): Promise<{ vault: BindingVault; space: BindingSpace }>;
   openVault(path: string, readOnly: boolean): Promise<BindingVault>;
   excludeFromBackup(path: string): Promise<boolean>;
+  /** iOS and Android only. */
+  releaseNativeReader?(handle: string): void;
   Value: {
     Null: new () => unknown;
     Integer: new (inner: { value: bigint }) => unknown;
@@ -64,6 +67,8 @@ interface BindingSpace extends Destroyable {
   copyToNewVault(path: string, words: BindingNewWords | undefined): Promise<BindingVault>;
   copyInto(vault: BindingVault, words: BindingNewWords | undefined): Promise<void>;
   lock(): Promise<void>;
+  /** iOS and Android only. */
+  nativeReader?(): Promise<string>;
 }
 
 interface BindingObjectWriter extends Destroyable {
@@ -240,6 +245,14 @@ export function wrap(binding: Binding): Temple {
 
     async isLocked() {
       return this.#inner === null;
+    }
+
+    async nativeReader(): Promise<NativeReader> {
+      const space = this.#space;
+      const release = binding.releaseNativeReader;
+      if (!space.nativeReader || !release) throw new TempleError('Io', 'native code reads spaces on iOS and Android only');
+      const handle = await run(() => space.nativeReader!());
+      return { handle, release: () => release(handle) };
     }
   }
 

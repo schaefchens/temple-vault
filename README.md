@@ -149,6 +149,37 @@ space.lock()?;
 let space = vault.unlock(&words)?.expect("these words open a space");
 ```
 
+### From native code
+
+On iOS and Android, the app's own native code – a media player reading audio piece by piece – can read a space's objects without them passing through JavaScript, from the space JavaScript opened:
+
+```ts
+const reader = await space.nativeReader();
+await Player.play(reader.handle, id); // the app's native module
+reader.release();                     // when done – or lock the space
+```
+
+```swift
+import TempleReactNative // the pod your module's podspec depends on: s.dependency 'TempleReactNative'
+
+let reader = TempleReader(handle: handle)
+let length = try reader.objectLength(id)                      // UInt64
+let data = try reader.readObject(id, start: 0, end: 65_536)   // Data
+```
+
+```kotlin
+import de.schaefchens.temple.TempleReader // implementation project(':schaefchens_temple-react-native')
+
+val reader = TempleReader(handle)
+val length = reader.objectLength(id)
+val bytes = reader.readObject(id, 0, 65_536)                  // ByteArray
+val read = reader.readObject(id, position, buffer, offset, n) // into a buffer, as a DataSource reads
+```
+
+- **Threads:** any. A call blocks until done, taking its turn among the space's calls – a long query or write delays it.
+- **Locked:** once the space locks or the handle is released, calls fail – `TempleReaderError` with kind `.locked`, `TempleReaderException` with `Kind.LOCKED`. A handle never keeps its space open.
+- **Ranges:** as `readObject` – up to the object's end, nothing beyond it.
+
 ## How it works
 
 - **Words to keys:** 12 words are 128 random bits and a checksum, laid out as in BIP-39. Argon2id with 64 MiB turns them into the phrase key, HKDF-SHA256 derives every other key from there.
@@ -159,7 +190,7 @@ let space = vault.unlock(&words)?.expect("these words open a space");
 
 ## Scope
 
-- **In Temple:** the vault file, words to keys, spaces (create, open, lock, change words, keep only this space, copy into another vault – under new words, too), storage inside a space, the phrase key for quick unlock, opening read-only, salvaging a damaged space. A Rust API, and TypeScript bindings for React Native (iOS, Android) and the web, with React hooks.
+- **In Temple:** the vault file, words to keys, spaces (create, open, lock, change words, keep only this space, copy into another vault – under new words, too), storage inside a space, the phrase key for quick unlock, opening read-only, salvaging a damaged space. A Rust API, and TypeScript bindings for React Native (iOS, Android) and the web, with React hooks; on iOS and Android, objects read from Swift and Kotlin too.
 - **In the app:** screens, wordlists (BIP-39's English one comes along), lock triggers, sealing the phrase key with the device's secure hardware, its own data schema, where vaults live and whether backups take them.
 
 ## Status
@@ -176,6 +207,7 @@ v1 built and tested, October 2026, its format final; 0.1.2 published as a previe
 | [docs/format.md](docs/format.md) | Vault format: file, keys, key blocks, inside a space |
 | [docs/storage-spike.md](docs/storage-spike.md) | Storage spike: SQLite against redb – results and decision |
 | [docs/review.md](docs/review.md) | Reviews of 2026-10-28 and 2026-10-29 – production readiness and crypto: findings by severity, each fixed or still open |
+| [docs/todo.md](docs/todo.md) | To do: sharing with groups – group keys, sealing to someone, twelve words for a group, large files, caches outside the vault; reading objects from native code (built) |
 | [tools/noise_sim.py](tools/noise_sim.py) | Noise simulation behind the format's numbers: `python3 tools/noise_sim.py` |
 | [tools/test_on_devices.sh](tools/test_on_devices.sh) | The tests on an Android emulator or phone and on the iOS simulator |
 | [tools/test_on_wasm.sh](tools/test_on_wasm.sh) | The tests on wasm32, in Node: 32-bit, one thread, the browser's clock and random source |
@@ -184,7 +216,7 @@ v1 built and tested, October 2026, its format final; 0.1.2 published as a previe
 | [spikes/storage](spikes/storage) | The storage spike's code: `cargo run --release` |
 | [bindings/ffi](bindings/ffi) | Temple's API for TypeScript through UniFFI, which uniffi-bindgen-react-native builds for React Native and the web |
 | [bindings/js](bindings/js) | `@schaefchens/temple`: the TypeScript API both platforms share, BIP-39's English wordlist, and the self-test |
-| [bindings/react-native](bindings/react-native) | `@schaefchens/temple-react-native`, for iOS and Android: `npm run build:ios`, `npm run build:android` |
+| [bindings/react-native](bindings/react-native) | `@schaefchens/temple-react-native`, for iOS and Android, with `TempleReader` for Swift and Kotlin: `npm run build:ios`, `npm run build:android` |
 | [bindings/web](bindings/web) | `@schaefchens/temple-web`: Temple in a worker, vaults in the origin private file system: `npm run build` |
 | [bindings/react](bindings/react) | `@schaefchens/temple-react`: hooks for a vault, its open space and queries, on either platform; tests: `npm test -w @schaefchens/temple-react` |
 | [examples/react-native](examples/react-native) | A notes app on Temple for iOS and Android (Expo), with Maestro flows: [tools/e2e_react_native.sh](tools/e2e_react_native.sh) |
@@ -194,7 +226,7 @@ v1 built and tested, October 2026, its format final; 0.1.2 published as a previe
 
 - **On phones:** every test passes on the Android emulator (Android 16, arm64) and the iOS simulator (iOS 26.3) as on the Mac. On the emulator slowed to a cheap phone's pace, the phrase key takes 1.1–1.65 s – inside the 2 s that settled Argon2 at 64 MiB ([format.md](docs/format.md#from-words-to-keys)).
 - **On wasm32:** every test but the real-file ones passes in Node (2026-10-29), 32-bit and on one thread.
-- **In apps:** the bindings' self-test – 22 checks, from SQL values, full-text search and objects in pieces to second spaces, typed words refused for new ones, changed words, read-only and salvaged spaces, rebuilding under new words and a vault opened twice – passes in the React Native demo on the iOS simulator and the Android emulator, and in the PWA in Chromium, Firefox and WebKit (2026-10-29). So do the demos' own flows, with Maestro and Playwright: two spaces that don't see each other, a file in and out, wrong words and a typo, locking when the app or page is left, a restart or reload – and on the web a second tab refused and working offline.
+- **In apps:** the bindings' self-test – 22 checks, from SQL values, full-text search and objects in pieces to second spaces, typed words refused for new ones, changed words, read-only and salvaged spaces, rebuilding under new words and a vault opened twice – passes in the React Native demo on the iOS simulator and the Android emulator, and in the PWA in Chromium, Firefox and WebKit (2026-10-29). So do the demos' own flows, with Maestro and Playwright: two spaces that don't see each other, a file in and out, wrong words and a typo, locking when the app or page is left, a restart or reload – and on the web a second tab refused and working offline. Native code's reads – the demo's Swift module on four threads at once, beside JavaScript's calls, refused once the space locks – pass in its self-test on the iOS simulator (2026-11-26); on Android they're built, not yet run.
 - **React hooks:** opening, unlocking, locking – a lock asked for while a space unlocks, too – and queries that run again after writes, against a Temple in memory.
 - **Crashes:** a crash at any write keeps every commit made durable – while a space is used, created, grows, locks, turns its log over, changes words or keeps only itself. A crash keeps what the last sync made durable and any choice of the 4 KiB pieces written since. A long run (`cargo test --release soak -- --ignored`) tries 8,000 crashes and 2,000 copies over 40 workloads, half of them turning the log over every few commits.
 - **Copies** taken during a session open to a state the space had. Taken while it locks, they open to the newest state – read front to back always, in random order in 195 of 200 tries; the rest don't open. So do copies taken while the log turns over. Taken across commits and a lock or a turnover, a copy may hold pages from both sides, which then fail when read; across several turnovers most don't open ([limits](docs/design.md#limits)). Never does a copy open to a state the space didn't have.
