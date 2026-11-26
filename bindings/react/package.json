@@ -1,6 +1,6 @@
 {
   "name": "@schaefchens/temple-react",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "React hooks for Temple, on React Native and the web",
   "license": "Apache-2.0",
   "repository": {
@@ -28,7 +28,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@schaefchens/temple": "0.1.2"
+    "@schaefchens/temple": "0.1.3"
   },
   "peerDependencies": {
     "react": ">=18"

@@ -6,7 +6,7 @@ Your app keeps its data – notes, settings, files, audio – in a **vault**: on
 
 That is **plausible deniability**: used as [design.md](docs/design.md#what-a-vault-reveals) describes, a vault gives no proof that it holds more than its user chose to show. What can still give a hidden space away – copies of a vault from different times, a forensic image of the phone – design.md measures, too.
 
-Temple runs inside your app on iOS and Android (React Native) and in the browser (a PWA), with one TypeScript API and React hooks for all three – and as a Rust library. It is open source (Apache 2.0) and young: v1 was built and tested in October 2026, and 0.1.2 is on npm and crates.io as a preview ([install](#install)) – but it hasn't had an external security audit yet.
+Temple runs inside your app on iOS and Android (React Native) and in the browser (a PWA), with one TypeScript API and React hooks for all three – and as a Rust library. It is open source (Apache 2.0) and young: v1 was built and tested in October 2026, and it is on npm (0.1.3) and crates.io (0.1.2) as a preview ([install](#install)) – but it hasn't had an external security audit yet.
 
 ### Made with AI
 
@@ -44,7 +44,7 @@ If your app only needs its data encrypted on the device, the phone's own encrypt
 
 ## Install
 
-Version 0.1.2 is a preview: the API may still change, and Temple waits for its external audit ([above](#made-with-ai)).
+Version 0.1.3 is a preview: the API may still change, and Temple waits for its external audit ([above](#made-with-ai)).
 
 ### React Native – iOS and Android
 
@@ -195,7 +195,7 @@ val read = reader.readObject(id, position, buffer, offset, n) // into a buffer, 
 
 ## Status
 
-v1 built and tested, October 2026, its format final; 0.1.2 published as a preview, and a release proper waits for an external security audit. Temple stays small so it can be audited whole: about 3,200 lines of Rust, of which about 650 are the unsafe bridge to SQLite and a few dozen call the system for file locks and the backup mark. It was made with AI ([above](#made-with-ai)).
+v1 built and tested, October 2026, its format final; 0.1.3 published as a preview (the Rust crate 0.1.2), and a release proper waits for an external security audit. Temple stays small so it can be audited whole: about 3,200 lines of Rust, of which about 650 are the unsafe bridge to SQLite and a few dozen call the system for file locks and the backup mark. It was made with AI ([above](#made-with-ai)).
 
 ## Repository
 
